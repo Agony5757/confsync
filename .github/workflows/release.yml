@@ -33,7 +33,9 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-client
+          skip-existing: true
       - name: Publish confsync-server to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist-server
+          skip-existing: true
