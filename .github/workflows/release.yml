@@ -1,0 +1,39 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # PyPI trusted publishing (no API token needed)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify tag matches package versions
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          for pkg in client/confsync server/confsync_server; do
+            PKG=$(python -c "import re; print(re.search(r'__version__ = \"(.+)\"', open('$pkg/__init__.py').read()).group(1))")
+            if [ "$TAG" != "$PKG" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match $pkg __version__ ($PKG)"
+              exit 1
+            fi
+          done
+      - name: Build both packages
+        run: |
+          python -m pip install build
+          python -m build client --outdir dist-client
+          python -m build server --outdir dist-server
+      - name: Publish confsync-client to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-client
+      - name: Publish confsync-server to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-server
