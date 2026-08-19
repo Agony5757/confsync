@@ -1,0 +1,10 @@
+# Server config — optional when using deploy/.env env vars.
+# Place at $CONFSYNC_HOME/server.yaml (default ~/.confsync-server/server.yaml).
+host: 0.0.0.0        # inside Docker listen on all interfaces; compose binds host port to 127.0.0.1
+port: 8930
+github:
+  client_id: "your-github-oauth-client-id"
+  client_secret: "your-github-oauth-client-secret"
+external_url: "https://confsync.tool.chenzhaoyun.com"
+allowed_users:
+  - "Agony5757"

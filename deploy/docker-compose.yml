@@ -1,0 +1,21 @@
+services:
+  confsync-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: confsync-server
+    restart: unless-stopped
+    ports:
+      # only the host nginx reverse proxy talks to the container
+      - "127.0.0.1:8930:8930"
+    volumes:
+      - confsync-data:/data
+    environment:
+      # secrets come from deploy/.env (gitignored) — see .env.example
+      CONFSYNC_GITHUB_CLIENT_ID: ${CONFSYNC_GITHUB_CLIENT_ID}
+      CONFSYNC_GITHUB_CLIENT_SECRET: ${CONFSYNC_GITHUB_CLIENT_SECRET}
+      CONFSYNC_EXTERNAL_URL: ${CONFSYNC_EXTERNAL_URL:-https://confsync.tool.chenzhaoyun.com}
+      CONFSYNC_ALLOWED_USERS: ${CONFSYNC_ALLOWED_USERS:-}
+
+volumes:
+  confsync-data:
