@@ -132,3 +132,11 @@ def test_web_requires_login(server):
     resp = client.get("/", follow_redirects=False)
     assert resp.status_code == 303
     assert resp.headers["location"] == "/login"
+
+
+def test_version_endpoint_is_public(server):
+    client, _ = server
+    from confsync_server import __version__
+    resp = client.get("/api/v1/version")  # no auth header
+    assert resp.status_code == 200
+    assert resp.json() == {"server": __version__}

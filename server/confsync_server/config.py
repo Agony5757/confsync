@@ -24,12 +24,19 @@ class ServerSettings:
     external_url: str = ""  # e.g. https://confsync.example.com (OAuth callback base)
     github_client_id: str = ""
     github_client_secret: str = ""
-    allowed_users: list[str] = field(default_factory=list)  # GitHub logins
+    gitea_url: str = ""  # self-hosted Gitea base URL, e.g. https://git.example.com
+    gitea_client_id: str = ""
+    gitea_client_secret: str = ""
+    allowed_users: list[str] = field(default_factory=list)  # provider logins
     home: str = ""
 
     @property
     def db_path(self) -> str:
         return os.path.join(self.home, "server.db")
+
+    @property
+    def gitea_configured(self) -> bool:
+        return bool(self.gitea_url and self.gitea_client_id)
 
 
 def load_settings(home: str | None = None) -> ServerSettings:
@@ -37,6 +44,7 @@ def load_settings(home: str | None = None) -> ServerSettings:
 
     Env overrides: CONFSYNC_HOST, CONFSYNC_PORT, CONFSYNC_EXTERNAL_URL,
     CONFSYNC_GITHUB_CLIENT_ID, CONFSYNC_GITHUB_CLIENT_SECRET,
+    CONFSYNC_GITEA_URL, CONFSYNC_GITEA_CLIENT_ID, CONFSYNC_GITEA_CLIENT_SECRET,
     CONFSYNC_ALLOWED_USERS (comma-separated).
     """
     import yaml
@@ -52,6 +60,7 @@ def load_settings(home: str | None = None) -> ServerSettings:
         raw = loaded or {}
 
     gh = raw.get("github", {}) or {}
+    gt = raw.get("gitea", {}) or {}
 
     s = ServerSettings(
         host=str(raw.get("host", "127.0.0.1")),
@@ -59,6 +68,9 @@ def load_settings(home: str | None = None) -> ServerSettings:
         external_url=str(raw.get("external_url", "")).rstrip("/"),
         github_client_id=str(gh.get("client_id", "")),
         github_client_secret=str(gh.get("client_secret", "")),
+        gitea_url=str(gt.get("url", "")).rstrip("/"),
+        gitea_client_id=str(gt.get("client_id", "")),
+        gitea_client_secret=str(gt.get("client_secret", "")),
         allowed_users=[str(u) for u in (raw.get("allowed_users", []) or [])],
         home=home,
     )
@@ -74,6 +86,12 @@ def load_settings(home: str | None = None) -> ServerSettings:
         s.github_client_id = env["CONFSYNC_GITHUB_CLIENT_ID"]
     if env.get("CONFSYNC_GITHUB_CLIENT_SECRET"):
         s.github_client_secret = env["CONFSYNC_GITHUB_CLIENT_SECRET"]
+    if env.get("CONFSYNC_GITEA_URL"):
+        s.gitea_url = env["CONFSYNC_GITEA_URL"].rstrip("/")
+    if env.get("CONFSYNC_GITEA_CLIENT_ID"):
+        s.gitea_client_id = env["CONFSYNC_GITEA_CLIENT_ID"]
+    if env.get("CONFSYNC_GITEA_CLIENT_SECRET"):
+        s.gitea_client_secret = env["CONFSYNC_GITEA_CLIENT_SECRET"]
     if env.get("CONFSYNC_ALLOWED_USERS"):
         s.allowed_users = [u.strip() for u in env["CONFSYNC_ALLOWED_USERS"].split(",") if u.strip()]
 

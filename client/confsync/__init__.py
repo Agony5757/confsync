@@ -9,7 +9,7 @@ Typical usage from another project (e.g. flexgate):
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from confsync.core import ConfsyncClient, ConfsyncError
 from confsync.credentials import load_client, login

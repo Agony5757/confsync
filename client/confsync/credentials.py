@@ -25,10 +25,12 @@ def login(server_url: str, api_key: str, *, verify: bool = True) -> ConfsyncClie
     """Validate and persist credentials; returns a ready client.
 
     With verify=True (default) the key is checked against the server first.
+    The key may be a confsync API key (``cs_…``) or, when the server has
+    Gitea configured, a Gitea access token.
     """
     server_url = validate_server_url(server_url)
-    if not api_key.startswith("cs_"):
-        raise ConfsyncError("API keys start with 'cs_'; create one in the web UI (/keys).")
+    if not api_key.strip():
+        raise ConfsyncError("empty API key/token")
     client = ConfsyncClient(server_url, api_key)
     if verify:
         client.whoami()  # raises ConfsyncError on a bad key

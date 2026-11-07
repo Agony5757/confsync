@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import sqlite3
 import time
 
@@ -14,6 +15,7 @@ SCHEMA = """\
 CREATE TABLE IF NOT EXISTS users (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     github_id  INTEGER NOT NULL UNIQUE,
+    gitea_id   INTEGER,
     login      TEXT    NOT NULL UNIQUE,
     name       TEXT    NOT NULL DEFAULT '',
     avatar_url TEXT    NOT NULL DEFAULT '',
@@ -68,6 +70,12 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def _placeholder_remote_id() -> int:
+    """Negative random id standing in for a provider id the user hasn't
+    logged in with yet (see create_bootstrap_user / upsert_gitea_user)."""
+    return -(secrets.randbelow(2**62) + 1)
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -75,13 +83,30 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Schema migrations for databases created before Gitea support."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    if "gitea_id" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN gitea_id INTEGER")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_gitea_id"
+        " ON users (gitea_id) WHERE gitea_id IS NOT NULL"
+    )
+    conn.commit()
 
 
 # ── users / allowlist ─────────────────────────────────────────────
 
 def get_user_by_github_id(conn: sqlite3.Connection, github_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM users WHERE github_id = ?", (github_id,)).fetchone()
+
+
+def get_user_by_gitea_id(conn: sqlite3.Connection, gitea_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM users WHERE gitea_id = ?", (gitea_id,)).fetchone()
 
 
 def get_user_by_id(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
@@ -143,12 +168,46 @@ def upsert_user(conn: sqlite3.Connection, github_id: int, login: str,
     return get_user_by_id(conn, cur.lastrowid)
 
 
+def upsert_gitea_user(conn: sqlite3.Connection, gitea_id: int, login: str,
+                      name: str, avatar_url: str) -> sqlite3.Row:
+    """Insert or refresh a user from their Gitea profile (mirror of
+    upsert_user). A user row whose login matches but has no gitea_id yet
+    (CLI-bootstrapped or GitHub-only) adopts the gitea_id, keeping its
+    documents and API keys."""
+    existing = get_user_by_gitea_id(conn, gitea_id)
+    now = time.time()
+    if existing:
+        conn.execute(
+            "UPDATE users SET login = ?, name = ?, avatar_url = ? WHERE id = ?",
+            (login, name, avatar_url, existing["id"]),
+        )
+        conn.commit()
+        return get_user_by_id(conn, existing["id"])
+    by_login = conn.execute("SELECT * FROM users WHERE login = ?", (login,)).fetchone()
+    if by_login is not None and by_login["gitea_id"] is None:
+        conn.execute(
+            "UPDATE users SET gitea_id = ?, name = ?, avatar_url = ? WHERE id = ?",
+            (gitea_id, name, avatar_url, by_login["id"]),
+        )
+        conn.commit()
+        return get_user_by_id(conn, by_login["id"])
+    is_admin = 1 if count_users(conn) == 0 else 0
+    cur = conn.execute(
+        "INSERT INTO users (github_id, gitea_id, login, name, avatar_url, is_admin, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (_placeholder_remote_id(), gitea_id, login, name, avatar_url, is_admin, now),
+    )
+    if is_admin:
+        conn.execute("INSERT OR IGNORE INTO allowed_logins (login) VALUES (?)", (login,))
+    conn.commit()
+    return get_user_by_id(conn, cur.lastrowid)
+
+
 def create_bootstrap_user(conn: sqlite3.Connection, login: str) -> sqlite3.Row:
     """Create a CLI-only user (placeholder negative github_id) so an API key
-    can be issued before GitHub OAuth is set up. On first OAuth login the row
-    adopts the real github_id (see upsert_user)."""
-    import secrets
-
+    can be issued before OAuth is set up. On first OAuth login (GitHub or
+    Gitea) the row adopts the real provider id (see upsert_user /
+    upsert_gitea_user)."""
     existing = conn.execute("SELECT * FROM users WHERE login = ?", (login,)).fetchone()
     if existing is not None:
         return existing
@@ -156,7 +215,7 @@ def create_bootstrap_user(conn: sqlite3.Connection, login: str) -> sqlite3.Row:
     cur = conn.execute(
         "INSERT INTO users (github_id, login, name, avatar_url, is_admin, created_at)"
         " VALUES (?, ?, '', '', ?, ?)",
-        (-(secrets.randbelow(2**62) + 1), login, is_admin, time.time()),
+        (_placeholder_remote_id(), login, is_admin, time.time()),
     )
     conn.execute("INSERT OR IGNORE INTO allowed_logins (login) VALUES (?)", (login,))
     conn.commit()

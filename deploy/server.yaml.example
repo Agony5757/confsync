@@ -5,6 +5,11 @@ port: 8930
 github:
   client_id: "your-github-oauth-client-id"
   client_secret: "your-github-oauth-client-secret"
+# Self-hosted Gitea login (optional). Callback URL: <external_url>/auth/gitea/callback
+# gitea:
+#   url: "https://git.example.com"
+#   client_id: "your-gitea-oauth-client-id"
+#   client_secret: "your-gitea-oauth-client-secret"
 external_url: "https://confsync.tool.chenzhaoyun.com"
 allowed_users:
   - "Agony5757"

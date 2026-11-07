@@ -37,10 +37,20 @@ def test_load_client_missing(tmp_path, monkeypatch):
         load_client()
 
 
-def test_login_rejects_bad_key_format(tmp_path, monkeypatch):
+def test_login_accepts_gitea_token(tmp_path, monkeypatch):
+    # non-cs_ credentials are fine: the server (whoami) decides whether it is
+    # a valid confsync API key or a Gitea access token.
+    creds = tmp_path / "c.json"
+    monkeypatch.setenv("CONFSYNC_CREDENTIALS", str(creds))
+    client = login("https://conf.example.com", "gt-e2e-token", verify=False)
+    client.close()
+    assert json.loads(creds.read_text())["api_key"] == "gt-e2e-token"
+
+
+def test_login_rejects_empty_key(tmp_path, monkeypatch):
     monkeypatch.setenv("CONFSYNC_CREDENTIALS", str(tmp_path / "c.json"))
     with pytest.raises(ConfsyncError):
-        login("https://conf.example.com", "not-a-cs-key", verify=False)
+        login("https://conf.example.com", "   ", verify=False)
 
 
 def _mock_app(request: httpx.Request) -> httpx.Response:

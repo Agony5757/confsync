@@ -23,6 +23,8 @@ your app (flexgate, ...)                     server (Docker, behind nginx TLS)
 | `server/` | `confsync-server` package (import name `confsync_server`) — Starlette app + `confsync-server` CLI. |
 | `deploy/` | Docker deployment: `Dockerfile`, `docker-compose.yml`, nginx vhost template. |
 
+Upgrading an existing deployment? See [MIGRATION.md](MIGRATION.md).
+
 ## Security model
 
 - **Transport**: TLS terminated at the reverse proxy (nginx + certbot). The
@@ -33,10 +35,12 @@ your app (flexgate, ...)                     server (Docker, behind nginx TLS)
   `CONFSYNC_MASTER_KEY` env var, base64). The document identity
   (`user/app/name`) is bound as AAD. SQLite only ever holds ciphertext.
 - **Auth**: GitHub OAuth for the Web UI (session cookies: HttpOnly, Secure,
-  SameSite=Lax; only sha256 of the session token is stored). API keys
-  (`cs_…`) for CLI/library access — only sha256 is stored, the plaintext is
-  shown once at creation. Access is restricted to an allowlist of GitHub
-  logins; the first user to log in becomes admin.
+  SameSite=Lax; only sha256 of the session token is stored). A self-hosted
+  **Gitea** can be used instead of (or alongside) GitHub: same OAuth flow for
+  the Web UI, and its access tokens are accepted directly by the REST API.
+  API keys (`cs_…`) for CLI/library access — only sha256 is stored, the
+  plaintext is shown once at creation. Access is restricted to an allowlist
+  of logins (GitHub or Gitea); the first user to log in becomes admin.
 - **History**: every push archives the previous version (last 20 kept), with
   view/rollback in the Web UI.
 
@@ -48,6 +52,7 @@ Prereqs: a host with Docker and nginx + certbot; a DNS name pointing at it
 1. Create a GitHub OAuth App at <https://github.com/settings/developers>:
    - Homepage URL: `https://confsync.tool.chenzhaoyun.com`
    - Authorization callback URL: `https://confsync.tool.chenzhaoyun.com/auth/github/callback`
+   (Prefer Gitea? Skip this step — see "Gitea login" below.)
 2. Copy `deploy/.env.example` to `deploy/.env` and fill in the client
    id/secret (and optionally `CONFSYNC_ALLOWED_USERS`).
 3. Build and start:
@@ -65,6 +70,28 @@ Prereqs: a host with Docker and nginx + certbot; a DNS name pointing at it
 5. Open `https://confsync.tool.chenzhaoyun.com`, sign in with GitHub (first
    login becomes admin), and create an API key under **API Keys**.
 
+### Gitea login
+
+A self-hosted Gitea can replace GitHub as the identity provider (the Web UI
+shows whichever providers are configured):
+
+1. In Gitea, create an OAuth2 application under
+   *Settings → Applications → Manage OAuth2 Applications*:
+   - Redirect URL: `https://confsync.tool.chenzhaoyun.com/auth/gitea/callback`
+2. Fill `CONFSYNC_GITEA_URL` (the Gitea base URL, e.g.
+   `https://git.example.com`), `CONFSYNC_GITEA_CLIENT_ID` and
+   `CONFSYNC_GITEA_CLIENT_SECRET` in `deploy/.env` and restart. The login
+   page now offers **Sign in with Gitea**.
+3. REST API auth also accepts Gitea access tokens: create one under
+   *Settings → Applications → Access Tokens* (scope `read:user` is enough)
+   and use it where an API key would go:
+   ```bash
+   confsync login --server https://confsync.tool.chenzhaoyun.com   # paste the Gitea token
+   ```
+   The server verifies each token against your Gitea (cached ~5 min) and
+   maps it to the confsync user with the same login — no API key needed.
+   Logins are gated by the same allowlist as OAuth.
+
 Bare-metal alternative (no Docker): `pip install ./server`, write
 `~/.confsync-server/server.yaml` (see `deploy/server.yaml.example`), then
 `confsync-server service install` for a systemd user unit.
@@ -72,20 +99,22 @@ Bare-metal alternative (no Docker): `pip install ./server`, write
 Server config: `$CONFSYNC_HOME/server.yaml` (default `~/.confsync-server/`),
 every key overridable by env (`CONFSYNC_HOST`, `CONFSYNC_PORT`,
 `CONFSYNC_EXTERNAL_URL`, `CONFSYNC_GITHUB_CLIENT_ID`,
-`CONFSYNC_GITHUB_CLIENT_SECRET`, `CONFSYNC_ALLOWED_USERS`,
-`CONFSYNC_MASTER_KEY`).
+`CONFSYNC_GITHUB_CLIENT_SECRET`, `CONFSYNC_GITEA_URL`,
+`CONFSYNC_GITEA_CLIENT_ID`, `CONFSYNC_GITEA_CLIENT_SECRET`,
+`CONFSYNC_ALLOWED_USERS`, `CONFSYNC_MASTER_KEY`).
 
 ## Client
 
 ```bash
 pip install ./client          # or: uv tool install ./client
 
-confsync login --server https://confsync.tool.chenzhaoyun.com   # paste API key
+confsync login --server https://confsync.tool.chenzhaoyun.com   # paste API key (or a Gitea access token)
 confsync push --app flexgate --name config.yaml --file ~/.flexgate/config.yaml
 confsync pull --app flexgate --name config.yaml                 # to stdout
 confsync pull --app flexgate --name config.yaml --version 3     # history version
 confsync list
 confsync history --app flexgate --name config.yaml
+confsync help            # offline docs: auth, upgrade, api, server, troubleshooting
 ```
 
 Credentials live at `~/.confsync/credentials.json` (mode 0600) and are shared
@@ -112,10 +141,12 @@ from confsync import ConfsyncClient
 client = ConfsyncClient("https://confsync.tool.chenzhaoyun.com", api_key="cs_...")
 ```
 
-REST API (all under `/api/v1`, `Authorization: Bearer cs_…`):
+REST API (all under `/api/v1`, `Authorization: Bearer cs_…` — a Gitea
+access token also works when the server has Gitea configured):
 
 | Method | Path | Purpose |
 |---|---|---|
+| GET | `/version` | public server version (no auth) |
 | GET | `/whoami` | verify the key |
 | GET | `/documents` | list documents |
 | GET/PUT/DELETE | `/documents/{app}/{name}` | pull / push (`{"content": "..."}`) / delete |

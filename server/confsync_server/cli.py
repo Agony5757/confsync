@@ -1,8 +1,12 @@
-"""confsync-server CLI: serve / service."""
+"""confsync-server CLI: serve / service / bootstrap / backup."""
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
+import sqlite3
 import sys
+import time
 
 from confsync_server import __version__
 from confsync_server.config import load_settings
@@ -53,6 +57,43 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     print(f"API key (shown once): {key}")
 
 
+def cmd_backup(args: argparse.Namespace) -> None:
+    """Hot backup: consistent sqlite snapshot of server.db + the master key.
+    Run this before upgrading the server (see MIGRATION.md)."""
+    settings = load_settings()
+    if not os.path.exists(settings.db_path):
+        print(f"error: no database at {settings.db_path} — is CONFSYNC_HOME correct?",
+              file=sys.stderr)
+        sys.exit(1)
+    out = args.out or os.path.join(
+        settings.home, "backups", time.strftime("confsync-%Y%m%d-%H%M%S")
+    )
+    os.makedirs(out, exist_ok=True)
+
+    db_out = os.path.join(out, "server.db")
+    src = sqlite3.connect(settings.db_path)
+    dst = sqlite3.connect(db_out)
+    try:
+        src.backup(dst)  # online backup API: safe while the server is running
+    finally:
+        src.close()
+        dst.close()
+    os.chmod(db_out, 0o600)
+
+    key_path = os.path.join(settings.home, "master.key")
+    if os.path.exists(key_path):
+        key_out = os.path.join(out, "master.key")
+        shutil.copyfile(key_path, key_out)
+        os.chmod(key_out, 0o600)
+        print(f"backup written to {out} (server.db + master.key)")
+    else:
+        print(f"backup written to {out} (server.db)")
+        print("note: master key comes from $CONFSYNC_MASTER_KEY — "
+              "back it up separately (secret manager).")
+    print(f"restore: stop confsync-server, copy the files back into "
+          f"{settings.home}, start again.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="confsync-server",
@@ -71,9 +112,14 @@ def main() -> None:
 
     boot = sub.add_parser(
         "bootstrap",
-        help="Create a user + API key without GitHub OAuth (adopts real GitHub id on first login)")
-    boot.add_argument("--login", required=True, help="GitHub login name of the user")
+        help="Create a user + API key without OAuth (adopts the real provider id on first login)")
+    boot.add_argument("--login", required=True, help="login name of the user (GitHub/Gitea)")
     boot.add_argument("--name", default="bootstrap", help="API key name")
+
+    backup = sub.add_parser(
+        "backup",
+        help="Hot backup of server.db + master key (run before upgrades)")
+    backup.add_argument("--out", help="Backup directory (default: $CONFSYNC_HOME/backups/<timestamp>)")
 
     args = parser.parse_args()
     if args.group == "serve":
@@ -82,6 +128,8 @@ def main() -> None:
         cmd_service(args)
     elif args.group == "bootstrap":
         cmd_bootstrap(args)
+    elif args.group == "backup":
+        cmd_backup(args)
     else:
         parser.print_help()
         sys.exit(0)

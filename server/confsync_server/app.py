@@ -10,11 +10,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from confsync_server import auth, crypto, db
+from confsync_server import __version__, auth, crypto, db
 from confsync_server.config import ServerSettings, load_settings
 
 SESSION_COOKIE = "confsync_session"
 MAX_CONTENT_BYTES = 4 * 1024 * 1024
+GITEA_TOKEN_CACHE_TTL = 5 * 60  # re-verify Gitea API tokens at most this often
 
 # ── rendering ─────────────────────────────────────────────────────
 
@@ -43,6 +44,7 @@ code.key { background: #fff8c5; padding: .4rem .6rem; border-radius: 6px;
          border-radius: 6px; margin-bottom: 1rem; }
 .muted { color: #656d76; font-size: .9em; }
 form.inline { display: inline; }
+p .btn { margin-right: .5rem; }
 """
 
 
@@ -127,14 +129,65 @@ def _require_web_user(request: Request):
     return user, None
 
 
-def _require_api_user(request: Request):
-    """Returns (user, response). response is a 401 JSON when unauthorized."""
+async def _require_api_user(request: Request):
+    """Returns (user, response). response is a 401/403 JSON when unauthorized.
+
+    Bearer tokens are either a confsync API key (``cs_…``) or, when Gitea is
+    configured, a Gitea access token verified against the Gitea instance."""
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):
         return None, JSONResponse({"error": "missing bearer token"}, status_code=401)
+    token = header[len("Bearer "):]
+    s = _settings(request)
+    if not token.startswith(auth.KEY_PREFIX):
+        if not s.gitea_configured:
+            return None, JSONResponse({"error": "invalid or revoked API key"}, status_code=401)
+        return await _gitea_token_user(request, token)
     conn = _open_db(request)
     try:
-        user = db.get_user_by_api_key(conn, header[len("Bearer "):])
+        user = db.get_user_by_api_key(conn, token)
+    finally:
+        conn.close()
+    if user is None:
+        return None, JSONResponse({"error": "invalid or revoked API key"}, status_code=401)
+    return user, None
+
+
+async def _gitea_token_user(request: Request, token: str):
+    """Authenticate a Gitea access token: verify it against the Gitea API,
+    gate the login on the allowlist, and map it to a confsync user
+    (auto-provisioned on first use). Verified tokens are cached briefly, so a
+    token revoked in Gitea stays valid for at most GITEA_TOKEN_CACHE_TTL."""
+    s = _settings(request)
+    cache = request.app.state.gitea_token_cache
+    token_hash = db.hash_token(token)
+    cached = cache.get(token_hash)
+    if cached is not None and cached[1] > time.time():
+        user_id = cached[0]
+    else:
+        try:
+            profile = await auth.fetch_gitea_user(s.gitea_url, token)
+        except ValueError as exc:
+            return None, JSONResponse({"error": str(exc)}, status_code=401)
+        conn = _open_db(request)
+        try:
+            if not db.is_login_allowed(conn, profile["login"]):
+                return None, JSONResponse(
+                    {"error": f"Gitea user '{profile['login']}' is not on the allowlist"},
+                    status_code=403,
+                )
+            user = db.upsert_gitea_user(conn, profile["id"], profile["login"],
+                                        profile["name"], profile["avatar_url"])
+        finally:
+            conn.close()
+        user_id = user["id"]
+        if len(cache) > 1024:
+            cache.clear()
+        cache[token_hash] = (user_id, time.time() + GITEA_TOKEN_CACHE_TTL)
+
+    conn = _open_db(request)
+    try:
+        user = db.get_user_by_id(conn, user_id)
     finally:
         conn.close()
     if user is None:
@@ -169,13 +222,19 @@ def _flash_error(request: Request) -> dict:
 async def login_page(request: Request) -> Response:
     if _session_user(request) is not None:
         return RedirectResponse("/", status_code=303)
-    if not _settings(request).github_client_id:
-        body = ("<p class='error'>GitHub OAuth is not configured on this server "
-                "(missing github.client_id).</p>")
+    s = _settings(request)
+    buttons = []
+    if s.github_client_id:
+        buttons.append('<a class="btn" href="/auth/github/login">Sign in with GitHub</a>')
+    if s.gitea_configured:
+        buttons.append('<a class="btn" href="/auth/gitea/login">Sign in with Gitea</a>')
+    if not buttons:
+        body = ("<p class='error'>No login provider is configured on this server "
+                "(missing github.client_id or gitea.url + gitea.client_id).</p>")
         return _page("Login", body)
-    body = """
+    body = f"""
     <h1>Sign in</h1>
-    <p><a class="btn" href="/auth/github/login">Sign in with GitHub</a></p>
+    <p>{''.join(buttons)}</p>
     """
     return _page("Login", body)
 
@@ -192,14 +251,55 @@ async def github_login(request: Request) -> Response:
     return RedirectResponse(url)
 
 
-async def github_callback(request: Request) -> Response:
+async def gitea_login(request: Request) -> Response:
     s = _settings(request)
+    if not s.gitea_configured:
+        return _page("Error", "", error="Gitea OAuth is not configured.")
+    state = auth.generate_oauth_state()
+    request.app.state.oauth_states.add(state)
+    url = auth.build_gitea_authorize_url(
+        s.gitea_url, s.gitea_client_id, f"{s.external_url}/auth/gitea/callback", state
+    )
+    return RedirectResponse(url)
+
+
+def _check_oauth_state(request: Request) -> str | None:
+    """Returns an error message when the OAuth state is missing/unknown."""
     state = request.query_params.get("state", "")
-    code = request.query_params.get("code", "")
     states = request.app.state.oauth_states
     if not state or state not in states:
-        return _page("Error", "", error="Invalid OAuth state; try logging in again.")
+        return "Invalid OAuth state; try logging in again."
     states.discard(state)
+    return None
+
+
+def _login_profile(request: Request, provider: str, profile: dict, upsert) -> Response:
+    """Allowlist-check an OAuth profile, upsert the user, start a session."""
+    conn = _open_db(request)
+    try:
+        if not db.is_login_allowed(conn, profile["login"]):
+            return _page("Access denied", "",
+                         error=f"{provider} user '{profile['login']}' is not on the allowlist.")
+        user = upsert(conn, profile["id"], profile["login"],
+                      profile["name"], profile["avatar_url"])
+        session_token = auth.generate_session_token()
+        db.create_session(conn, user["id"], session_token)
+    finally:
+        conn.close()
+    resp = RedirectResponse("/", status_code=303)
+    resp.set_cookie(
+        SESSION_COOKIE, session_token,
+        max_age=db.SESSION_TTL, httponly=True, samesite="lax",
+        secure=_settings(request).external_url.startswith("https://"),
+    )
+    return resp
+
+
+async def github_callback(request: Request) -> Response:
+    s = _settings(request)
+    if (err := _check_oauth_state(request)) is not None:
+        return _page("Error", "", error=err)
+    code = request.query_params.get("code", "")
     if not code:
         return _page("Error", "", error="Missing OAuth code from GitHub.")
 
@@ -212,25 +312,27 @@ async def github_callback(request: Request) -> Response:
     except ValueError as exc:
         return _page("Error", "", error=str(exc))
 
-    conn = _open_db(request)
-    try:
-        if not db.is_login_allowed(conn, profile["login"]):
-            return _page("Access denied", "",
-                         error=f"GitHub user '{profile['login']}' is not on the allowlist.")
-        user = db.upsert_user(conn, profile["id"], profile["login"],
-                              profile["name"], profile["avatar_url"])
-        session_token = auth.generate_session_token()
-        db.create_session(conn, user["id"], session_token)
-    finally:
-        conn.close()
+    return _login_profile(request, "GitHub", profile, db.upsert_user)
 
-    resp = RedirectResponse("/", status_code=303)
-    resp.set_cookie(
-        SESSION_COOKIE, session_token,
-        max_age=db.SESSION_TTL, httponly=True, samesite="lax",
-        secure=s.external_url.startswith("https://"),
-    )
-    return resp
+
+async def gitea_callback(request: Request) -> Response:
+    s = _settings(request)
+    if (err := _check_oauth_state(request)) is not None:
+        return _page("Error", "", error=err)
+    code = request.query_params.get("code", "")
+    if not code:
+        return _page("Error", "", error="Missing OAuth code from Gitea.")
+
+    try:
+        token = await auth.exchange_gitea_code(
+            s.gitea_url, s.gitea_client_id, s.gitea_client_secret, code,
+            f"{s.external_url}/auth/gitea/callback",
+        )
+        profile = await auth.fetch_gitea_user(s.gitea_url, token)
+    except ValueError as exc:
+        return _page("Error", "", error=str(exc))
+
+    return _login_profile(request, "Gitea", profile, db.upsert_gitea_user)
 
 
 async def logout(request: Request) -> Response:
@@ -489,11 +591,11 @@ async def web_admin(request: Request) -> Response:
         for login in allowed
     )
     body = f"""
-    <h1>Admin — allowed GitHub logins</h1>
+    <h1>Admin — allowed logins</h1>
     <table><tr><th>Login</th><th></th></tr>{rows}</table>
     <h2>Add login</h2>
     <form method="post" action="/admin/allow">
-      <input type="text" name="login" placeholder="github username" required>
+      <input type="text" name="login" placeholder="username (GitHub or Gitea)" required>
       <button class="primary" type="submit">Allow</button>
     </form>
     """
@@ -535,15 +637,21 @@ async def web_admin_disallow(request: Request) -> Response:
 
 # ── REST API ──────────────────────────────────────────────────────
 
+async def api_version(request: Request) -> Response:
+    """Public server version — lets clients/operators check what is running
+    before authenticating (used by the upgrade procedure)."""
+    return JSONResponse({"server": __version__})
+
+
 async def api_whoami(request: Request) -> Response:
-    user, resp = _require_api_user(request)
+    user, resp = await _require_api_user(request)
     if resp:
         return resp
     return JSONResponse({"login": user["login"], "name": user["name"]})
 
 
 async def api_list(request: Request) -> Response:
-    user, resp = _require_api_user(request)
+    user, resp = await _require_api_user(request)
     if resp:
         return resp
     conn = _open_db(request)
@@ -559,7 +667,7 @@ async def api_list(request: Request) -> Response:
 
 
 async def api_get(request: Request) -> Response:
-    user, resp = _require_api_user(request)
+    user, resp = await _require_api_user(request)
     if resp:
         return resp
     app, name = request.path_params["app"], request.path_params["name"]
@@ -577,7 +685,7 @@ async def api_get(request: Request) -> Response:
 
 
 async def api_put(request: Request) -> Response:
-    user, resp = _require_api_user(request)
+    user, resp = await _require_api_user(request)
     if resp:
         return resp
     app, name = request.path_params["app"], request.path_params["name"]
@@ -595,7 +703,7 @@ async def api_put(request: Request) -> Response:
 
 
 async def api_delete(request: Request) -> Response:
-    user, resp = _require_api_user(request)
+    user, resp = await _require_api_user(request)
     if resp:
         return resp
     app, name = request.path_params["app"], request.path_params["name"]
@@ -610,7 +718,7 @@ async def api_delete(request: Request) -> Response:
 
 
 async def api_history(request: Request) -> Response:
-    user, resp = _require_api_user(request)
+    user, resp = await _require_api_user(request)
     if resp:
         return resp
     app, name = request.path_params["app"], request.path_params["name"]
@@ -626,7 +734,7 @@ async def api_history(request: Request) -> Response:
 
 
 async def api_history_get(request: Request) -> Response:
-    user, resp = _require_api_user(request)
+    user, resp = await _require_api_user(request)
     if resp:
         return resp
     app, name = request.path_params["app"], request.path_params["name"]
@@ -665,6 +773,8 @@ def create_app(settings: ServerSettings | None = None) -> Starlette:
         Route("/login", login_page),
         Route("/auth/github/login", github_login),
         Route("/auth/github/callback", github_callback),
+        Route("/auth/gitea/login", gitea_login),
+        Route("/auth/gitea/callback", gitea_callback),
         Route("/logout", logout),
         Route("/keys", web_keys),
         Route("/keys/create", web_key_create, methods=["POST"]),
@@ -677,6 +787,7 @@ def create_app(settings: ServerSettings | None = None) -> Starlette:
         Route("/docs/{app}/{name:path}/delete", web_doc_delete, methods=["POST"]),
         Route("/docs/{app}/{name:path}", web_doc_view),
         Route("/docs/{app}/{name:path}", web_doc_save, methods=["POST"]),
+        Route("/api/v1/version", api_version),
         Route("/api/v1/whoami", api_whoami),
         Route("/api/v1/documents", api_list),
         Route("/api/v1/documents/{app}/{name:path}/history/{version:int}", api_history_get),
@@ -690,4 +801,5 @@ def create_app(settings: ServerSettings | None = None) -> Starlette:
     app.state.settings = settings
     app.state.master_key = master_key
     app.state.oauth_states = set()
+    app.state.gitea_token_cache = {}
     return app
