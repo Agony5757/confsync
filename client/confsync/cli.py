@@ -33,7 +33,7 @@ Two kinds of credentials are accepted:
                         from Gitea (Settings -> Applications -> Access
                         Tokens, scope read:user is enough). The server
                         verifies it against your Gitea (cached ~5 min) and
-                        maps it to the confsync user with the same login.
+                        maps it to your confsync account (identity or email).
 
 Requires client >= 0.2.0 for Gitea tokens (older clients insist on cs_ keys).\
 """,

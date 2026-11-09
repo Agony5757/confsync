@@ -15,7 +15,7 @@ def test_backup_captures_db_and_key(tmp_path, monkeypatch, capsys):
     settings = load_settings()
 
     conn = db.connect(settings.db_path)
-    db.upsert_user(conn, 1001, "alice", "Alice", "")
+    account = db.create_account(conn, "alice", name="Alice")
     conn.close()
     (home / "master.key").write_bytes(b"k" * 32)
 
@@ -25,9 +25,9 @@ def test_backup_captures_db_and_key(tmp_path, monkeypatch, capsys):
     # db snapshot is a consistent, usable copy
     snap = sqlite3.connect(str(out / "server.db"))
     snap.row_factory = sqlite3.Row
-    row = snap.execute("SELECT login FROM users").fetchone()
+    row = snap.execute("SELECT username FROM accounts").fetchone()
     snap.close()
-    assert row["login"] == "alice"
+    assert row["username"] == "alice"
 
     # master key copied with restrictive permissions
     assert (out / "master.key").read_bytes() == b"k" * 32

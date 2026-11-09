@@ -34,13 +34,19 @@ Upgrading an existing deployment? See [MIGRATION.md](MIGRATION.md).
   master key (auto-generated at `$CONFSYNC_HOME/master.key`, mode 0600, or the
   `CONFSYNC_MASTER_KEY` env var, base64). The document identity
   (`user/app/name`) is bound as AAD. SQLite only ever holds ciphertext.
-- **Auth**: GitHub OAuth for the Web UI (session cookies: HttpOnly, Secure,
-  SameSite=Lax; only sha256 of the session token is stored). A self-hosted
-  **Gitea** can be used instead of (or alongside) GitHub: same OAuth flow for
-  the Web UI, and its access tokens are accepted directly by the REST API.
-  API keys (`cs_…`) for CLI/library access — only sha256 is stored, the
-  plaintext is shown once at creation. Access is restricted to an allowlist
-  of logins (GitHub or Gitea); the first user to log in becomes admin.
+- **Auth & accounts**: identity is a **unified account** — one row per
+  person with `uid`, `username` and a list of bound emails — never the raw
+  provider login. GitHub/Gitea OAuth (for the Web UI; session cookies:
+  HttpOnly, Secure, SameSite=Lax; only sha256 of the session token is
+  stored) and Gitea access tokens (for the REST API) both resolve to an
+  account: a known provider identity wins, else the login email is matched
+  against the account's bound emails, else a pre-created account with the
+  same username is adopted, else a new account is created — gated by an
+  allowlist of usernames (the first user to log in becomes admin). Documents,
+  API keys and sessions belong to the account, so accounts only ever see
+  their own documents. API keys (`cs_…`) for CLI/library access — only
+  sha256 is stored, the plaintext is shown once at creation. Admins manage
+  accounts, email bindings and the allowlist under `/admin`.
 - **History**: every push archives the previous version (last 20 kept), with
   view/rollback in the Web UI.
 
@@ -89,7 +95,8 @@ shows whichever providers are configured):
    confsync login --server https://confsync.tool.chenzhaoyun.com   # paste the Gitea token
    ```
    The server verifies each token against your Gitea (cached ~5 min) and
-   maps it to the confsync user with the same login — no API key needed.
+   maps it to your confsync account (by identity or bound email) — no API
+   key needed.
    Logins are gated by the same allowlist as OAuth.
 
 Bare-metal alternative (no Docker): `pip install ./server`, write

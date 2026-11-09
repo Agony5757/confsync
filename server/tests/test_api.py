@@ -16,15 +16,16 @@ def server(tmp_path):
     )
     app = create_app(settings)
 
-    # Create two users with API keys directly in the DB.
+    # Create two accounts with API keys directly in the DB.
     conn = db.connect(settings.db_path)
     keys = {}
-    for login_name, gh_id in (("alice", 1001), ("bob", 1002)):
-        user = db.upsert_user(conn, gh_id, login_name, login_name, "")
-        db.allow_login(conn, login_name)
+    for username, gh_id in (("alice", 1001), ("bob", 1002)):
+        account = db.create_account(conn, username)
+        db.link_identity(conn, account["uid"], "github", gh_id, username)
+        db.allow_login(conn, username)
         key = auth.generate_api_key()
-        db.create_api_key(conn, user["id"], "test", key)
-        keys[login_name] = key
+        db.create_api_key(conn, account["uid"], "test", key)
+        keys[username] = key
     conn.close()
 
     with TestClient(app) as client:
@@ -39,7 +40,8 @@ def test_whoami(server):
     client, keys = server
     resp = client.get("/api/v1/whoami", headers=_hdr(keys["alice"]))
     assert resp.status_code == 200
-    assert resp.json()["login"] == "alice"
+    assert resp.json()["username"] == "alice"
+    assert resp.json()["login"] == "alice"  # legacy alias
 
 
 def test_missing_and_bad_key_rejected(server):
@@ -120,9 +122,10 @@ def test_revoked_key_rejected(server, tmp_path):
     # revoke alice's key at the db layer
     settings = client.app.state.settings
     conn = db.connect(settings.db_path)
-    user = conn.execute("SELECT * FROM users WHERE login = 'alice'").fetchone()
-    key_id = db.list_api_keys(conn, user["id"])[0]["id"]
-    db.revoke_api_key(conn, user["id"], key_id)
+    account = conn.execute(
+        "SELECT * FROM accounts WHERE username = 'alice'").fetchone()
+    key_id = db.list_api_keys(conn, account["uid"])[0]["id"]
+    db.revoke_api_key(conn, account["uid"], key_id)
     conn.close()
     assert client.get("/api/v1/documents", headers=_hdr(keys["alice"])).status_code == 401
 

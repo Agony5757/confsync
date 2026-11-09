@@ -48,12 +48,14 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     settings = load_settings()
     conn = db.connect(settings.db_path)
     try:
-        user = db.create_bootstrap_user(conn, args.login)
+        account = db.get_account_by_username(conn, args.username) \
+            or db.create_account(conn, args.username)
+        db.allow_login(conn, args.username)
         key = auth.generate_api_key()
-        db.create_api_key(conn, user["id"], args.name, key)
+        db.create_api_key(conn, account["uid"], args.name, key)
     finally:
         conn.close()
-    print(f"User '{args.login}' ready (admin={bool(user['is_admin'])}).")
+    print(f"Account '{account['username']}' ready (admin={bool(account['is_admin'])}).")
     print(f"API key (shown once): {key}")
 
 
@@ -112,8 +114,10 @@ def main() -> None:
 
     boot = sub.add_parser(
         "bootstrap",
-        help="Create a user + API key without OAuth (adopts the real provider id on first login)")
-    boot.add_argument("--login", required=True, help="login name of the user (GitHub/Gitea)")
+        help="Create an account + API key without OAuth (the account adopts "
+             "provider identities on their first login)")
+    boot.add_argument("--username", required=True,
+                      help="username of the account (linked on first GitHub/Gitea login)")
     boot.add_argument("--name", default="bootstrap", help="API key name")
 
     backup = sub.add_parser(

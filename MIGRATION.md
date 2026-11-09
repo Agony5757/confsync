@@ -1,18 +1,28 @@
 # Upgrading confsync
 
-Rollout guide for existing deployments. Example below upgrades **0.1.x →
-0.2.x** (the Gitea login release), but the same steps apply to any version.
+Rollout guide for existing deployments. Example below upgrades **0.2.x →
+0.3.x** (the unified-account release), but the same steps apply to any
+version.
 
-What 0.2.0 changes on the server:
+What 0.3.0 changes on the server:
 
-- **New (optional) Gitea login**: Web UI OAuth + Gitea access tokens accepted
-  by the REST API. With no Gitea env vars set, behavior is identical to 0.1.x.
-- **DB schema**: `users` gains a nullable `gitea_id` column + unique index.
-  Applied **automatically on first start** (idempotent `ALTER TABLE`, < 1 s,
-  no data rewrite). 0.1.x code keeps working against the migrated DB (it
-  ignores the extra column), so rollback needs no schema undo.
-- **New public endpoint** `GET /api/v1/version`, and a `confsync-server
-  backup` command for hot backups.
+- **Unified accounts**: identity is no longer "the GitHub/Gitea login". A
+  single `accounts` table holds each person once — `uid`, `username`,
+  `email_binding_list` (any number of bound emails) — and provider logins
+  live in an `identities` table mapped to an account. Login resolution order:
+  known identity → matching bound email → same-username account (allowlisted)
+  → new account (allowlist-gated). Documents, API keys and sessions belong to
+  the account, so different accounts see different documents.
+- **DB schema**: the old `users` table is migrated automatically on first
+  start: every user row becomes an account **keeping its numeric id as uid**
+  (document ciphertexts bind the uid as AAD — ids must not change), and its
+  github_id/gitea_id become identity rows. One-time rewrite, < 1 s at this
+  scale. 0.2.x code does **not** work against the migrated DB — roll back by
+  restoring the pre-upgrade backup.
+- **Admin UI**: `/admin` now manages accounts (create, bind/unbind emails,
+  grant/revoke admin) plus the allowlist of usernames that may self-register.
+- **REST API**: `/api/v1/whoami` returns `username` (plus the old `login`
+  field as an alias, so 0.x clients keep working). No other API changes.
 
 ## 1. Server upgrade (Docker)
 
@@ -23,20 +33,20 @@ survives rebuilds untouched.
 
 ```bash
 # 0) hot backup — no downtime needed (snapshot via sqlite online-backup API)
-docker exec confsync-server confsync-server backup --out /data/backups/pre-0.2.0
-docker cp confsync-server:/data/backups/pre-0.2.0 .   # keep a copy off-container
+docker exec confsync-server confsync-server backup --out /data/backups/pre-0.3.0
+docker cp confsync-server:/data/backups/pre-0.3.0 .   # keep a copy off-container
 
 # 1) bring the new code (adjust path/remote to your setup)
 cd /root
-mv confsync confsync.old-0.1.0
-git clone --depth 1 -b v0.2.0 https://github.com/Agony5757/confsync.git
-cp confsync.old-0.1.0/deploy/.env confsync/deploy/.env   # secrets carry over
+mv confsync confsync.old-0.2.0
+git clone --depth 1 -b v0.3.0 https://github.com/Agony5757/confsync.git
+cp confsync.old-0.2.0/deploy/.env confsync/deploy/.env   # secrets carry over
 
 # 2) rebuild & restart (schema migration runs on startup)
 cd confsync/deploy && docker compose up -d --build
 
 # 3) verify
-curl -s https://<your-host>/api/v1/version        # → {"server": "0.2.0"}
+curl -s https://<your-host>/api/v1/version        # → {"server": "0.3.0"}
 docker logs confsync-server --tail 20
 confsync pull --app <app> --name <doc>            # from any logged-in client
 ```
@@ -44,7 +54,7 @@ confsync pull --app <app> --name <doc>            # from any logged-in client
 Rollback:
 
 ```bash
-cd /root/confsync.old-0.1.0/deploy && docker compose up -d --build
+cd /root/confsync.old-0.2.0/deploy && docker compose up -d --build
 ```
 
 No schema rollback required. Only if data itself must be restored:
@@ -64,7 +74,7 @@ the volume (`/data`), `docker compose up -d`.
 ### Bare metal (no Docker)
 
 ```bash
-pip install -U confsync-server==0.2.0     # or: pip install <path-to-repo>/server
+pip install -U confsync-server==0.3.0     # or: pip install <path-to-repo>/server
 confsync-server backup                    # $CONFSYNC_HOME/backups/<timestamp>
 confsync-server service restart
 ```

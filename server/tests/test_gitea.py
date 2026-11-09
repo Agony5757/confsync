@@ -1,4 +1,4 @@
-"""Gitea login: OAuth web flow, access-token API auth, db upsert/migration."""
+"""Gitea login: OAuth web flow, access-token API auth, account linking."""
 import sqlite3
 from urllib.parse import parse_qs, urlparse
 
@@ -11,7 +11,8 @@ from confsync_server.config import ServerSettings, load_settings
 
 GITEA_URL = "http://git.example.com"
 GITEA_PROFILE = {"id": 7, "login": "gitea-user", "name": "Gitea User",
-                 "avatar_url": f"{GITEA_URL}/avatars/7"}
+                 "avatar_url": f"{GITEA_URL}/avatars/7",
+                 "email": "gitea-user@example.com"}
 
 
 @pytest.fixture()
@@ -85,69 +86,49 @@ def test_build_gitea_authorize_url():
     }
 
 
-# ── db ────────────────────────────────────────────────────────────
+# ── account resolution ────────────────────────────────────────────
 
-def test_gitea_first_user_becomes_admin(tmp_path):
+def test_first_gitea_login_creates_admin_account(tmp_path):
+    from confsync_server.app import _resolve_account
     conn = db.connect(str(tmp_path / "t.db"))
     assert db.is_login_allowed(conn, "anyone")  # empty db → bootstrap open
-    user = db.upsert_gitea_user(conn, 7, "gitea-user", "Gitea User", "")
-    assert user["is_admin"] == 1
-    assert user["gitea_id"] == 7
-    assert user["github_id"] < 0  # placeholder until a GitHub login links it
+    account = _resolve_account(conn, "gitea", GITEA_PROFILE)
+    assert account["is_admin"] == 1
+    assert account["username"] == "gitea-user"
+    assert [i["provider"] for i in db.list_identities(conn, account["uid"])] == ["gitea"]
 
-    # refresh by gitea_id updates the profile, no duplicate row
-    again = db.upsert_gitea_user(conn, 7, "gitea-user", "Renamed", "")
-    assert again["id"] == user["id"]
-    assert again["name"] == "Renamed"
-    assert db.count_users(conn) == 1
+    # logging in again resolves to the same account, no duplicate
+    again = _resolve_account(conn, "gitea", GITEA_PROFILE)
+    assert again["uid"] == account["uid"]
+    assert db.count_accounts(conn) == 1
     conn.close()
 
 
-def test_bootstrap_user_adopts_gitea_id(tmp_path):
+def test_bootstrap_account_adopts_gitea_identity(tmp_path):
+    from confsync_server.app import _resolve_account
     conn = db.connect(str(tmp_path / "t.db"))
-    boot = db.create_bootstrap_user(conn, "carol")
-    user = db.upsert_gitea_user(conn, 3003, "carol", "Carol", "")
-    assert user["id"] == boot["id"]
-    assert user["gitea_id"] == 3003
-    assert db.count_users(conn) == 1
+    boot = db.create_account(conn, "carol")   # e.g. confsync-server bootstrap
+    db.allow_login(conn, "carol")
+    account = _resolve_account(conn, "gitea",
+                               {"id": 3003, "login": "carol", "name": "Carol",
+                                "avatar_url": "", "email": ""})
+    assert account["uid"] == boot["uid"]
+    assert db.count_accounts(conn) == 1
     conn.close()
 
 
-def test_gitea_id_is_unique(tmp_path):
+def test_gitea_and_github_same_email_share_account(tmp_path):
+    from confsync_server.app import _resolve_account
     conn = db.connect(str(tmp_path / "t.db"))
-    db.upsert_gitea_user(conn, 9, "a", "A", "")
-    db.allow_login(conn, "b")
-    db.upsert_gitea_user(conn, 10, "b", "B", "")
-    with pytest.raises(sqlite3.IntegrityError):
-        conn.execute("UPDATE users SET gitea_id = 9 WHERE login = 'b'")
-    conn.close()
-
-
-def test_migration_adds_gitea_id_to_existing_db(tmp_path):
-    path = str(tmp_path / "old.db")
-    conn = sqlite3.connect(path)
-    conn.executescript("""\
-CREATE TABLE users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    github_id INTEGER NOT NULL UNIQUE,
-    login TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL DEFAULT '',
-    avatar_url TEXT NOT NULL DEFAULT '',
-    is_admin INTEGER NOT NULL DEFAULT 0,
-    created_at REAL NOT NULL
-);
-INSERT INTO users (github_id, login, created_at) VALUES (1, 'old', 100);
-""")
-    conn.commit()
-    conn.close()
-
-    conn = db.connect(path)  # connect() applies the migration
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
-    assert "gitea_id" in cols
-    # existing GitHub-only row links to the gitea account with the same login
-    user = db.upsert_gitea_user(conn, 55, "old", "Old", "")
-    assert user["id"] == 1
-    assert user["github_id"] == 1 and user["gitea_id"] == 55
+    gh = _resolve_account(conn, "github",
+                          {"id": 1001, "login": "Agony5757", "name": "A",
+                           "avatar_url": "", "email": "me@example.com"})
+    db.bind_email(conn, gh["uid"], "me@example.com")
+    gt = _resolve_account(conn, "gitea",
+                          {"id": 7, "login": "agony", "name": "A",
+                           "avatar_url": "", "email": "me@example.com"})
+    assert gt["uid"] == gh["uid"]  # email binding linked both providers
+    assert {i["provider"] for i in db.list_identities(conn, gh["uid"])} == {"github", "gitea"}
     conn.close()
 
 
@@ -180,12 +161,15 @@ def test_gitea_oauth_callback_logs_in(gitea_server, monkeypatch):
     state = _oauth_state(gitea_server)
     resp = gitea_server.get(f"/auth/gitea/callback?code=c&state={state}")
     assert resp.status_code == 200  # followed the redirect to /
-    assert "gitea-user" in resp.text  # nav shows the logged-in user
+    assert "gitea-user" in resp.text  # nav shows the logged-in account
 
     conn = db.connect(gitea_server.app.state.settings.db_path)
-    row = conn.execute("SELECT * FROM users WHERE login = 'gitea-user'").fetchone()
+    row = conn.execute(
+        "SELECT a.*, i.provider FROM accounts a"
+        " JOIN identities i ON i.uid = a.uid WHERE a.username = 'gitea-user'"
+    ).fetchone()
     conn.close()
-    assert row["gitea_id"] == 7 and row["is_admin"] == 1
+    assert row["provider"] == "gitea" and row["is_admin"] == 1
 
 
 def test_gitea_oauth_callback_rejects_bad_state(gitea_server):
@@ -195,7 +179,7 @@ def test_gitea_oauth_callback_rejects_bad_state(gitea_server):
 
 def test_gitea_oauth_denied_when_not_allowlisted(gitea_server, monkeypatch):
     conn = db.connect(gitea_server.app.state.settings.db_path)
-    db.upsert_user(conn, 1001, "admin", "Admin", "")  # users exist → allowlist applies
+    db.create_account(conn, "admin")  # accounts exist → allowlist applies
     conn.close()
 
     async def fake_exchange(gitea_url, client_id, client_secret, code, redirect_uri):
@@ -225,7 +209,8 @@ def test_api_accepts_gitea_token_with_cache(gitea_server, monkeypatch):
 
     resp = gitea_server.get("/api/v1/whoami", headers=h)
     assert resp.status_code == 200
-    assert resp.json() == {"login": "gitea-user", "name": "Gitea User"}
+    assert resp.json() == {"username": "gitea-user", "login": "gitea-user",
+                           "name": "Gitea User"}
 
     # second call is served from the cache — Gitea hit only once
     assert gitea_server.get("/api/v1/documents", headers=h).status_code == 200
@@ -246,7 +231,7 @@ def test_api_rejects_invalid_gitea_token(gitea_server, monkeypatch):
 
 def test_api_gitea_token_respects_allowlist(gitea_server, monkeypatch):
     conn = db.connect(gitea_server.app.state.settings.db_path)
-    db.upsert_user(conn, 1001, "admin", "Admin", "")  # users exist → allowlist applies
+    db.create_account(conn, "admin")  # accounts exist → allowlist applies
     conn.close()
     _patch_fetch(monkeypatch, token="good-token")
     resp = gitea_server.get("/api/v1/whoami",

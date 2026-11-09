@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 
@@ -68,7 +69,7 @@ def _page(title: str, body: str, user=None, flash: str = "", error: str = "") ->
           <a href="/keys">API Keys</a>
           {admin_link}
           <span class="spacer"></span>
-          <span class="muted">{_e(user['login'])}</span>
+          <span class="muted">{_e(user['username'])}</span>
           <a href="/logout">Logout</a>
         </nav>"""
     else:
@@ -89,10 +90,15 @@ def _page(title: str, body: str, user=None, flash: str = "", error: str = "") ->
     return Response(page, media_type="text/html")
 
 
-def _redirect(url: str, flash: str = "") -> RedirectResponse:
+def _redirect(url: str, flash: str = "", error: str = "") -> RedirectResponse:
+    params = []
     if flash:
+        params.append(f"flash={flash}")
+    if error:
+        params.append(f"error={error}")
+    if params:
         sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}flash={flash}"
+        url = f"{url}{sep}{'&'.join(params)}"
     return RedirectResponse(url, status_code=303)
 
 
@@ -171,23 +177,22 @@ async def _gitea_token_user(request: Request, token: str):
             return None, JSONResponse({"error": str(exc)}, status_code=401)
         conn = _open_db(request)
         try:
-            if not db.is_login_allowed(conn, profile["login"]):
+            account = _resolve_account(conn, "gitea", profile)
+            if account is None:
                 return None, JSONResponse(
                     {"error": f"Gitea user '{profile['login']}' is not on the allowlist"},
                     status_code=403,
                 )
-            user = db.upsert_gitea_user(conn, profile["id"], profile["login"],
-                                        profile["name"], profile["avatar_url"])
         finally:
             conn.close()
-        user_id = user["id"]
+        user_id = account["uid"]
         if len(cache) > 1024:
             cache.clear()
         cache[token_hash] = (user_id, time.time() + GITEA_TOKEN_CACHE_TTL)
 
     conn = _open_db(request)
     try:
-        user = db.get_user_by_id(conn, user_id)
+        user = db.get_account_by_uid(conn, user_id)
     finally:
         conn.close()
     if user is None:
@@ -273,17 +278,60 @@ def _check_oauth_state(request: Request) -> str | None:
     return None
 
 
-def _login_profile(request: Request, provider: str, profile: dict, upsert) -> Response:
-    """Allowlist-check an OAuth profile, upsert the user, start a session."""
+def _resolve_account(conn, provider: str, profile: dict):
+    """Map a provider profile (OAuth login or verified token) to an account:
+    an existing identity row → its account; else a matching bound email →
+    that account (linking the new identity to it); else a brand-new account
+    whose candidate username must pass the allowlist. Returns None when the
+    login would create a new account that is not allowlisted."""
+    identity = db.get_identity(conn, provider, profile["id"])
+    if identity is not None:
+        db.touch_identity(conn, identity["id"], profile["login"], profile.get("email", ""))
+        db.update_account_profile(conn, identity["uid"], profile["name"],
+                                  profile["avatar_url"])
+        return db.get_account_by_uid(conn, identity["uid"])
+    email = profile.get("email") or ""
+    if email:
+        account = db.get_account_by_email(conn, email)
+        if account is not None:
+            db.link_identity(conn, account["uid"], provider, profile["id"],
+                             profile["login"], email)
+            db.update_account_profile(conn, account["uid"], profile["name"],
+                                      profile["avatar_url"])
+            return db.get_account_by_uid(conn, account["uid"])
+    if not db.is_login_allowed(conn, profile["login"]):
+        return None
+    # A pre-created account with exactly this username (e.g. ``confsync-server
+    # bootstrap``) adopts the identity on its first login with this provider.
+    account = db.get_account_by_username(conn, profile["login"])
+    if account is not None:
+        linked = {i["provider"] for i in db.list_identities(conn, account["uid"])}
+        if provider not in linked:
+            db.link_identity(conn, account["uid"], provider, profile["id"],
+                             profile["login"], email)
+            db.update_account_profile(conn, account["uid"], profile["name"],
+                                      profile["avatar_url"])
+            return db.get_account_by_uid(conn, account["uid"])
+    account = db.create_account(conn, profile["login"], name=profile["name"],
+                                avatar_url=profile["avatar_url"])
+    db.link_identity(conn, account["uid"], provider, profile["id"],
+                     profile["login"], email)
+    return account
+
+
+def _login_profile(request: Request, provider: str, profile: dict) -> Response:
+    """Resolve the OAuth profile to an account (allowlist gates new accounts)
+    and start a web session."""
     conn = _open_db(request)
     try:
-        if not db.is_login_allowed(conn, profile["login"]):
-            return _page("Access denied", "",
-                         error=f"{provider} user '{profile['login']}' is not on the allowlist.")
-        user = upsert(conn, profile["id"], profile["login"],
-                      profile["name"], profile["avatar_url"])
+        account = _resolve_account(conn, provider, profile)
+        if account is None:
+            return _page(
+                "Access denied", "",
+                error=f"{provider.title()} login '{profile['login']}' would create a "
+                      f"new account, but that username is not on the allowlist.")
         session_token = auth.generate_session_token()
-        db.create_session(conn, user["id"], session_token)
+        db.create_session(conn, account["uid"], session_token)
     finally:
         conn.close()
     resp = RedirectResponse("/", status_code=303)
@@ -312,7 +360,7 @@ async def github_callback(request: Request) -> Response:
     except ValueError as exc:
         return _page("Error", "", error=str(exc))
 
-    return _login_profile(request, "GitHub", profile, db.upsert_user)
+    return _login_profile(request, "github", profile)
 
 
 async def gitea_callback(request: Request) -> Response:
@@ -332,7 +380,7 @@ async def gitea_callback(request: Request) -> Response:
     except ValueError as exc:
         return _page("Error", "", error=str(exc))
 
-    return _login_profile(request, "Gitea", profile, db.upsert_gitea_user)
+    return _login_profile(request, "gitea", profile)
 
 
 async def logout(request: Request) -> Response:
@@ -356,7 +404,7 @@ async def web_index(request: Request) -> Response:
         return resp
     conn = _open_db(request)
     try:
-        docs = db.list_documents(conn, user["id"])
+        docs = db.list_documents(conn, user["uid"])
     finally:
         conn.close()
     rows = "".join(
@@ -382,12 +430,12 @@ async def web_doc_view(request: Request) -> Response:
     version_q = request.query_params.get("version")
     conn = _open_db(request)
     try:
-        row = db.get_document(conn, user["id"], app, name)
+        row = db.get_document(conn, user["uid"], app, name)
         if row is None:
             return _page("Not found", "", user, error=f"No document {app}/{name}.")
-        history = db.list_history(conn, user["id"], app, name)
+        history = db.list_history(conn, user["uid"], app, name)
         if version_q:
-            hrow = db.get_history_version(conn, user["id"], app, name, int(version_q))
+            hrow = db.get_history_version(conn, user["uid"], app, name, int(version_q))
             if hrow is None:
                 return _page("Not found", "", user, error=f"No version {version_q}.")
             content, shown_version = _decrypt_doc(request, hrow), hrow["version"]
@@ -434,7 +482,7 @@ async def web_doc_save(request: Request) -> Response:
     content = str(form.get("content", ""))
     if len(content.encode()) > MAX_CONTENT_BYTES:
         return _page("Too large", "", user, error="Content exceeds 4 MB limit.")
-    version = _store_doc(request, user["id"], app, name, content)
+    version = _store_doc(request, user["uid"], app, name, content)
     return _redirect(f"/docs/{app}/{name}", flash=f"Saved as v{version}.")
 
 
@@ -447,9 +495,9 @@ async def web_doc_raw(request: Request) -> Response:
     conn = _open_db(request)
     try:
         if version_q:
-            row = db.get_history_version(conn, user["id"], app, name, int(version_q))
+            row = db.get_history_version(conn, user["uid"], app, name, int(version_q))
         else:
-            row = db.get_document(conn, user["id"], app, name)
+            row = db.get_document(conn, user["uid"], app, name)
         if row is None:
             return PlainTextResponse("not found", status_code=404)
         content = _decrypt_doc(request, row)
@@ -467,7 +515,7 @@ async def web_doc_delete(request: Request) -> Response:
     app, name = request.path_params["app"], request.path_params["name"]
     conn = _open_db(request)
     try:
-        db.delete_document(conn, user["id"], app, name)
+        db.delete_document(conn, user["uid"], app, name)
     finally:
         conn.close()
     return _redirect("/", flash=f"Deleted {app}/{name}.")
@@ -482,13 +530,13 @@ async def web_doc_rollback(request: Request) -> Response:
     version = int(form.get("version", "0"))
     conn = _open_db(request)
     try:
-        hrow = db.get_history_version(conn, user["id"], app, name, version)
+        hrow = db.get_history_version(conn, user["uid"], app, name, version)
         if hrow is None:
             return _page("Not found", "", user, error=f"No history version {version}.")
         content = _decrypt_doc(request, hrow)
     finally:
         conn.close()
-    new_version = _store_doc(request, user["id"], app, name, content)
+    new_version = _store_doc(request, user["uid"], app, name, content)
     return _redirect(f"/docs/{app}/{name}",
                      flash=f"Rolled back to v{version} content (saved as v{new_version}).")
 
@@ -501,7 +549,7 @@ async def web_keys(request: Request) -> Response:
         return resp
     conn = _open_db(request)
     try:
-        keys = db.list_api_keys(conn, user["id"])
+        keys = db.list_api_keys(conn, user["uid"])
     finally:
         conn.close()
     rows = ""
@@ -544,7 +592,7 @@ async def web_key_create(request: Request) -> Response:
     plaintext = auth.generate_api_key()
     conn = _open_db(request)
     try:
-        db.create_api_key(conn, user["id"], name, plaintext)
+        db.create_api_key(conn, user["uid"], name, plaintext)
     finally:
         conn.close()
     body = f"""
@@ -564,7 +612,7 @@ async def web_key_revoke(request: Request) -> Response:
     key_id = int(request.path_params["key_id"])
     conn = _open_db(request)
     try:
-        db.revoke_api_key(conn, user["id"], key_id)
+        db.revoke_api_key(conn, user["uid"], key_id)
     finally:
         conn.close()
     return _redirect("/keys", flash="Key revoked.")
@@ -580,10 +628,37 @@ async def web_admin(request: Request) -> Response:
         return _page("Forbidden", "", user, error="Admin only.")
     conn = _open_db(request)
     try:
+        accounts = db.list_accounts(conn)
         allowed = db.list_allowed_logins(conn)
     finally:
         conn.close()
-    rows = "".join(
+    rows = ""
+    for a in accounts:
+        admin_badge = " <b>· admin</b>" if a["is_admin"] else ""
+        emails = " · ".join(
+            f"{_e(e)} <form class='inline' method='post'"
+            f" action='/admin/accounts/{a['uid']}/emails/remove'>"
+            f"<input type='hidden' name='email' value='{_e(e)}'>"
+            f"<button type='submit'>×</button></form>"
+            for e in a["emails"]
+        ) or "<span class='muted'>none</span>"
+        rows += (
+            f"<tr><td>{a['uid']}</td>"
+            f"<td><b>{_e(a['username'])}</b>{admin_badge}"
+            f"<br><span class='muted'>{_e(a['identities'] or 'no linked logins')}</span></td>"
+            f"<td>{emails}</td>"
+            f"<td><form class='inline' method='post' action='/admin/accounts/{a['uid']}/emails/add'>"
+            f"<input type='text' name='email' placeholder='add email' required>"
+            f"<button type='submit'>Bind</button></form></td>"
+            f"<td><form class='inline' method='post' action='/admin/accounts/{a['uid']}/admin'>"
+            f"<button type='submit'>{'Revoke admin' if a['is_admin'] else 'Make admin'}</button></form></td>"
+            f"</tr>"
+        )
+    accounts_table = (
+        "<table><tr><th>uid</th><th>username</th><th>email bindings</th>"
+        f"<th></th><th></th></tr>{rows}</table>"
+    )
+    allow_rows = "".join(
         f"<tr><td>{_e(login)}</td>"
         f"<td><form class='inline' method='post' action='/admin/disallow'>"
         f"<input type='hidden' name='login' value='{_e(login)}'>"
@@ -591,15 +666,112 @@ async def web_admin(request: Request) -> Response:
         for login in allowed
     )
     body = f"""
-    <h1>Admin — allowed logins</h1>
-    <table><tr><th>Login</th><th></th></tr>{rows}</table>
-    <h2>Add login</h2>
+    <h1>Admin — accounts</h1>
+    <p class="muted">Each account has one uid + username and any number of bound
+    emails. GitHub/Gitea logins map to an account by linked identity, or by
+    email binding; documents are private to an account.</p>
+    {accounts_table}
+    <h2>Create account</h2>
+    <form method="post" action="/admin/accounts/create">
+      <input type="text" name="username" placeholder="username" required>
+      <input type="text" name="emails" placeholder="emails, comma separated (optional)">
+      <button class="primary" type="submit">Create</button>
+    </form>
+    <h2>Allowlist (usernames that may self-register)</h2>
+    <table><tr><th>Username</th><th></th></tr>{allow_rows}</table>
     <form method="post" action="/admin/allow">
-      <input type="text" name="login" placeholder="username (GitHub or Gitea)" required>
+      <input type="text" name="login" placeholder="username (as they log in on GitHub/Gitea)" required>
       <button class="primary" type="submit">Allow</button>
     </form>
     """
     return _page("Admin", body, user, **_flash_error(request))
+
+
+def _admin_action(request: Request):
+    """Returns (user, response). response is set when not an admin."""
+    user, resp = _require_web_user(request)
+    if resp:
+        return None, resp
+    if not user["is_admin"]:
+        return None, _page("Forbidden", "", user, error="Admin only.")
+    return user, None
+
+
+async def web_admin_account_create(request: Request) -> Response:
+    user, resp = _admin_action(request)
+    if resp:
+        return resp
+    form = await request.form()
+    username = str(form.get("username", "")).strip()
+    emails = [e.strip() for e in str(form.get("emails", "")).split(",") if e.strip()]
+    if not username:
+        return _redirect("/admin", error="Username is required.")
+    conn = _open_db(request)
+    try:
+        try:
+            account = db.create_account(conn, username)
+            for e in emails:
+                db.bind_email(conn, account["uid"], e)
+        except (ValueError, LookupError, sqlite3.IntegrityError) as exc:
+            return _redirect("/admin", error=f"Cannot create account: {exc}")
+    finally:
+        conn.close()
+    return _redirect("/admin", flash=f"Created account '{account['username']}' (uid {account['uid']}).")
+
+
+async def web_admin_email_add(request: Request) -> Response:
+    user, resp = _admin_action(request)
+    if resp:
+        return resp
+    uid = int(request.path_params["uid"])
+    form = await request.form()
+    email = str(form.get("email", "")).strip()
+    conn = _open_db(request)
+    try:
+        try:
+            added = db.bind_email(conn, uid, email)
+        except (ValueError, LookupError) as exc:
+            return _redirect("/admin", error=f"Cannot bind email: {exc}")
+    finally:
+        conn.close()
+    flash = f"Bound {email}." if added else f"{email} was already bound."
+    return _redirect("/admin", flash=flash)
+
+
+async def web_admin_email_remove(request: Request) -> Response:
+    user, resp = _admin_action(request)
+    if resp:
+        return resp
+    uid = int(request.path_params["uid"])
+    form = await request.form()
+    email = str(form.get("email", "")).strip()
+    conn = _open_db(request)
+    try:
+        removed = db.unbind_email(conn, uid, email)
+    finally:
+        conn.close()
+    if not removed:
+        return _redirect("/admin", error=f"{email} was not bound to uid {uid}.")
+    return _redirect("/admin", flash=f"Unbound {email} from uid {uid}.")
+
+
+async def web_admin_account_admin(request: Request) -> Response:
+    user, resp = _admin_action(request)
+    if resp:
+        return resp
+    uid = int(request.path_params["uid"])
+    conn = _open_db(request)
+    try:
+        account = db.get_account_by_uid(conn, uid)
+        if account is None:
+            return _redirect("/admin", error=f"No account uid={uid}.")
+        if uid == user["uid"]:
+            return _redirect("/admin", error="You cannot revoke your own admin.")
+        db.set_account_admin(conn, uid, not account["is_admin"])
+    finally:
+        conn.close()
+    verb = "granted admin to" if not account["is_admin"] else "revoked admin from"
+    return _redirect("/admin", flash=f"{verb} uid {uid} ({account['username']}).")
 
 
 async def web_admin_allow(request: Request) -> Response:
@@ -647,7 +819,8 @@ async def api_whoami(request: Request) -> Response:
     user, resp = await _require_api_user(request)
     if resp:
         return resp
-    return JSONResponse({"login": user["login"], "name": user["name"]})
+    return JSONResponse({"username": user["username"], "login": user["username"],
+                         "name": user["name"]})
 
 
 async def api_list(request: Request) -> Response:
@@ -656,7 +829,7 @@ async def api_list(request: Request) -> Response:
         return resp
     conn = _open_db(request)
     try:
-        docs = db.list_documents(conn, user["id"])
+        docs = db.list_documents(conn, user["uid"])
     finally:
         conn.close()
     return JSONResponse({"documents": [
@@ -673,7 +846,7 @@ async def api_get(request: Request) -> Response:
     app, name = request.path_params["app"], request.path_params["name"]
     conn = _open_db(request)
     try:
-        row = db.get_document(conn, user["id"], app, name)
+        row = db.get_document(conn, user["uid"], app, name)
         if row is None:
             return JSONResponse({"error": f"no document {app}/{name}"}, status_code=404)
         return JSONResponse({
@@ -698,7 +871,7 @@ async def api_put(request: Request) -> Response:
         return JSONResponse({"error": "body must be {\"content\": \"...\"}"}, status_code=400)
     if len(content.encode()) > MAX_CONTENT_BYTES:
         return JSONResponse({"error": "content exceeds 4 MB limit"}, status_code=413)
-    version = _store_doc(request, user["id"], app, name, content)
+    version = _store_doc(request, user["uid"], app, name, content)
     return JSONResponse({"app": app, "name": name, "version": version})
 
 
@@ -709,7 +882,7 @@ async def api_delete(request: Request) -> Response:
     app, name = request.path_params["app"], request.path_params["name"]
     conn = _open_db(request)
     try:
-        existed = db.delete_document(conn, user["id"], app, name)
+        existed = db.delete_document(conn, user["uid"], app, name)
     finally:
         conn.close()
     if not existed:
@@ -724,7 +897,7 @@ async def api_history(request: Request) -> Response:
     app, name = request.path_params["app"], request.path_params["name"]
     conn = _open_db(request)
     try:
-        rows = db.list_history(conn, user["id"], app, name)
+        rows = db.list_history(conn, user["uid"], app, name)
     finally:
         conn.close()
     return JSONResponse({"history": [
@@ -741,7 +914,7 @@ async def api_history_get(request: Request) -> Response:
     version = int(request.path_params["version"])
     conn = _open_db(request)
     try:
-        row = db.get_history_version(conn, user["id"], app, name, version)
+        row = db.get_history_version(conn, user["uid"], app, name, version)
         if row is None:
             return JSONResponse({"error": f"no version {version}"}, status_code=404)
         return JSONResponse({
@@ -782,6 +955,10 @@ def create_app(settings: ServerSettings | None = None) -> Starlette:
         Route("/admin", web_admin),
         Route("/admin/allow", web_admin_allow, methods=["POST"]),
         Route("/admin/disallow", web_admin_disallow, methods=["POST"]),
+        Route("/admin/accounts/create", web_admin_account_create, methods=["POST"]),
+        Route("/admin/accounts/{uid:int}/emails/add", web_admin_email_add, methods=["POST"]),
+        Route("/admin/accounts/{uid:int}/emails/remove", web_admin_email_remove, methods=["POST"]),
+        Route("/admin/accounts/{uid:int}/admin", web_admin_account_admin, methods=["POST"]),
         Route("/docs/{app}/{name:path}/raw", web_doc_raw),
         Route("/docs/{app}/{name:path}/rollback", web_doc_rollback, methods=["POST"]),
         Route("/docs/{app}/{name:path}/delete", web_doc_delete, methods=["POST"]),
