@@ -55,7 +55,9 @@ def test_username_uniqueness_case_insensitive_lookup(tmp_path):
 
 def test_migration_preserves_uid_and_link_identities(tmp_path):
     """Old users table → accounts keep their numeric id (ciphertext AAD!) and
-    gain identity rows for their linked providers."""
+    gain identity rows for their linked providers. The 0.2 schema declares
+    FOREIGN KEYs on sessions/api_keys/documents pointing at users — the
+    migration rebuilds them against accounts."""
     path = str(tmp_path / "old.db")
     conn = sqlite3.connect(path)
     conn.executescript("""\
@@ -69,13 +71,24 @@ CREATE TABLE users (
     is_admin INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL
 );
-INSERT INTO users (github_id, gitea_id, login, is_admin, created_at)
-VALUES (1, NULL, 'gh-only', 1, 100);
-INSERT INTO users (github_id, gitea_id, login, is_admin, created_at)
-VALUES (2, 7, 'both', 0, 101);
+CREATE TABLE sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    expires_at REAL    NOT NULL
+);
+CREATE TABLE api_keys (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER NOT NULL REFERENCES users(id),
+    name         TEXT    NOT NULL DEFAULT '',
+    key_hash     TEXT    NOT NULL UNIQUE,
+    prefix       TEXT    NOT NULL,
+    created_at   REAL    NOT NULL,
+    last_used_at REAL,
+    revoked      INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE documents (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
     app        TEXT    NOT NULL,
     name       TEXT    NOT NULL,
     ciphertext BLOB    NOT NULL,
@@ -83,6 +96,13 @@ CREATE TABLE documents (
     updated_at REAL    NOT NULL,
     UNIQUE (user_id, app, name)
 );
+INSERT INTO users (github_id, gitea_id, login, is_admin, created_at)
+VALUES (1, NULL, 'gh-only', 1, 100);
+INSERT INTO users (github_id, gitea_id, login, is_admin, created_at)
+VALUES (2, 7, 'both', 0, 101);
+INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ('h1', 1, 9e18);
+INSERT INTO api_keys (user_id, name, key_hash, prefix, created_at)
+VALUES (2, 'k', 'kh', 'cs_1234', 100);
 INSERT INTO documents (user_id, app, name, ciphertext, version, updated_at)
 VALUES (1, 'app', 'doc', X'00', 1, 100);
 """)
@@ -93,6 +113,7 @@ VALUES (1, 'app', 'doc', X'00', 1, 100);
     tables = {r["name"] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert "users" not in tables
+    assert "sessions_old" not in tables
 
     gh_only = db.get_account_by_username(conn, "gh-only")
     both = db.get_account_by_username(conn, "both")
@@ -100,8 +121,12 @@ VALUES (1, 'app', 'doc', X'00', 1, 100);
     assert both["uid"] == 2
     assert {i["provider"] for i in db.list_identities(conn, 1)} == {"github"}
     assert {i["provider"] for i in db.list_identities(conn, 2)} == {"github", "gitea"}
-    # document ownership carried over to the same uid
+    # child rows carried over to the same uid, FKs now reference accounts
     assert conn.execute("SELECT user_id FROM documents").fetchone()["user_id"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0] == 1
+    # inserts into the rebuilt tables still satisfy FK enforcement
+    db.create_session(conn, 1, "tok")
     conn.close()
 
 

@@ -96,6 +96,40 @@ def connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+# Child tables referencing accounts, used by the pre-0.3 migration to
+# rebuild rows whose FOREIGN KEY clauses pointed at the old users table.
+_CHILD_DDL = {
+    "sessions": """\
+CREATE TABLE sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES accounts(uid),
+    expires_at REAL    NOT NULL
+)""",
+    "api_keys": """\
+CREATE TABLE api_keys (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER NOT NULL REFERENCES accounts(uid),
+    name         TEXT    NOT NULL DEFAULT '',
+    key_hash     TEXT    NOT NULL UNIQUE,
+    prefix       TEXT    NOT NULL,
+    created_at   REAL    NOT NULL,
+    last_used_at REAL,
+    revoked      INTEGER NOT NULL DEFAULT 0
+)""",
+    "documents": """\
+CREATE TABLE documents (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES accounts(uid),
+    app        TEXT    NOT NULL,
+    name       TEXT    NOT NULL,
+    ciphertext BLOB    NOT NULL,
+    version    INTEGER NOT NULL,
+    updated_at REAL    NOT NULL,
+    UNIQUE (user_id, app, name)
+)""",
+}
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Schema migrations for databases created before the account model.
 
@@ -108,6 +142,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     tables = {r["name"] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'")}
     if "users" in tables:
+        conn.commit()  # PRAGMA foreign_keys is a no-op inside a transaction
+        conn.execute("PRAGMA foreign_keys=OFF")
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
         if "gitea_id" not in cols:  # 0.1.x database
             conn.execute("ALTER TABLE users ADD COLUMN gitea_id INTEGER")
@@ -130,7 +166,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
                     " login, linked_at) VALUES (?, 'gitea', ?, ?, ?)",
                     (u["id"], str(u["gitea_id"]), u["login"], u["created_at"]),
                 )
+        # Child tables still carry FOREIGN KEY clauses pointing at ``users``;
+        # rebuild them against accounts (identical columns) before dropping it.
+        for name, ddl in _CHILD_DDL.items():
+            conn.execute(f"ALTER TABLE {name} RENAME TO {name}_old")
+            conn.execute(ddl)
+            conn.execute(f"INSERT INTO {name} SELECT * FROM {name}_old")
+            conn.execute(f"DROP TABLE {name}_old")
         conn.execute("DROP TABLE users")
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys=ON")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_identities_provider_uid"
         " ON identities (provider, provider_uid)"
