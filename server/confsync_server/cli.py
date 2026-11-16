@@ -43,20 +43,21 @@ def cmd_service(args: argparse.Namespace) -> None:
 
 
 def cmd_bootstrap(args: argparse.Namespace) -> None:
-    from confsync_server import auth, db
+    from confsync_server import auth, crypto, db
 
     settings = load_settings()
+    master_key = crypto.load_or_create_master_key(settings.home)
     conn = db.connect(settings.db_path)
     try:
         account = db.get_account_by_username(conn, args.username) \
             or db.create_account(conn, args.username)
         db.allow_login(conn, args.username)
         key = auth.generate_api_key()
-        db.create_api_key(conn, account["uid"], args.name, key)
+        db.create_api_key(conn, account["uid"], args.name, key, master_key=master_key)
     finally:
         conn.close()
     print(f"Account '{account['username']}' ready (admin={bool(account['is_admin'])}).")
-    print(f"API key (shown once): {key}")
+    print(f"API key: {key}")
 
 
 def cmd_backup(args: argparse.Namespace) -> None:

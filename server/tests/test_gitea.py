@@ -1,7 +1,9 @@
 """Gitea login: OAuth web flow, access-token API auth, account linking."""
+import asyncio
 import sqlite3
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
@@ -86,6 +88,30 @@ def test_build_gitea_authorize_url():
     }
 
 
+def test_gitea_token_exchange_uses_form_encoding(monkeypatch):
+    def handler(request):
+        assert request.url == f"{GITEA_URL}/login/oauth/access_token"
+        assert request.headers["Content-Type"] == "application/x-www-form-urlencoded"
+        assert parse_qs(request.content.decode()) == {
+            "client_id": ["cid"],
+            "client_secret": ["secret"],
+            "code": ["oauth code"],
+            "grant_type": ["authorization_code"],
+            "redirect_uri": ["https://cb.example.com/cb"],
+        }
+        return httpx.Response(200, json={"access_token": "oauth-token"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    token = asyncio.run(auth.exchange_gitea_code(
+        GITEA_URL, "cid", "secret", "oauth code", "https://cb.example.com/cb"
+    ))
+    assert token == "oauth-token"
+
+
 # ── account resolution ────────────────────────────────────────────
 
 def test_first_gitea_login_creates_admin_account(tmp_path):
@@ -123,11 +149,11 @@ def test_gitea_and_github_same_email_share_account(tmp_path):
     gh = _resolve_account(conn, "github",
                           {"id": 1001, "login": "Agony5757", "name": "A",
                            "avatar_url": "", "email": "me@example.com"})
-    db.bind_email(conn, gh["uid"], "me@example.com")
+    assert db.get_account_by_email(conn, "ME@example.com")["uid"] == gh["uid"]
     gt = _resolve_account(conn, "gitea",
                           {"id": 7, "login": "agony", "name": "A",
                            "avatar_url": "", "email": "me@example.com"})
-    assert gt["uid"] == gh["uid"]  # email binding linked both providers
+    assert gt["uid"] == gh["uid"]  # automatically bound email linked both providers
     assert {i["provider"] for i in db.list_identities(conn, gh["uid"])} == {"github", "gitea"}
     conn.close()
 

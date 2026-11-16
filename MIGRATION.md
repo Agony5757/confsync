@@ -4,6 +4,17 @@ Rollout guide for existing deployments. Example below upgrades **0.2.x →
 0.3.x** (the unified-account release), but the same steps apply to any
 version.
 
+What 0.4.0 changes on the server:
+
+- **OAuth reliability/account linking**: Gitea token exchange uses the standard
+  form encoding, upstream/network failures render as login errors instead of
+  HTTP 500, and verified logins automatically bind the provider email so
+  GitHub and Gitea resolve to one account.
+- **Retrievable API keys**: new keys store a sha256 auth hash plus an
+  AES-256-GCM ciphertext; logged-in owners can view/copy them under `/keys`.
+  Existing hash-only keys keep working but cannot be revealed — create a
+  replacement. The `api_keys.key_ciphertext` column is added automatically.
+
 What 0.3.0 changes on the server:
 
 - **Unified accounts**: identity is no longer "the GitHub/Gitea login". A

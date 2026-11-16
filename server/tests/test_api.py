@@ -24,7 +24,8 @@ def server(tmp_path):
         db.link_identity(conn, account["uid"], "github", gh_id, username)
         db.allow_login(conn, username)
         key = auth.generate_api_key()
-        db.create_api_key(conn, account["uid"], "test", key)
+        db.create_api_key(conn, account["uid"], "test", key,
+                          master_key=app.state.master_key)
         keys[username] = key
     conn.close()
 
@@ -135,6 +136,62 @@ def test_web_requires_login(server):
     resp = client.get("/", follow_redirects=False)
     assert resp.status_code == 303
     assert resp.headers["location"] == "/login"
+
+
+def _web_session(client, username):
+    conn = db.connect(client.app.state.settings.db_path)
+    account = db.get_account_by_username(conn, username)
+    token = f"{username}-web-session"
+    db.create_session(conn, account["uid"], token)
+    conn.close()
+    return {"confsync_session": token}
+
+
+def test_web_key_create_view_copy_and_authenticate(server):
+    client, keys = server
+    cookies = _web_session(client, "alice")
+
+    created = client.post("/keys/create", data={"name": "browser"}, cookies=cookies)
+    assert created.status_code == 200
+
+    conn = db.connect(client.app.state.settings.db_path)
+    account = db.get_account_by_username(conn, "alice")
+    row = [k for k in db.list_api_keys(conn, account["uid"]) if k["name"] == "browser"][0]
+    plaintext = db.decrypt_api_key(row, client.app.state.master_key)
+    conn.close()
+
+    assert plaintext in created.text
+    assert "data-copy-target=\"new-api-key\"" in created.text
+    page = client.get("/keys", cookies=cookies)
+    assert page.status_code == 200
+    assert plaintext in page.text
+    assert f"data-copy-target='api-key-{row['id']}'" in page.text
+    assert "navigator.clipboard.writeText" in page.text
+    assert keys["bob"] not in page.text
+    assert client.get("/api/v1/whoami", headers=_hdr(plaintext)).status_code == 200
+
+
+def test_web_legacy_hash_only_key_cannot_be_revealed(server):
+    client, _ = server
+    cookies = _web_session(client, "alice")
+    conn = db.connect(client.app.state.settings.db_path)
+    account = db.get_account_by_username(conn, "alice")
+    conn.execute(
+        "INSERT INTO api_keys (user_id, name, key_hash, prefix, created_at)"
+        " VALUES (?, 'legacy', ?, 'cs_lega', 0)",
+        (account["uid"], db.hash_token("cs_legacy-secret")),
+    )
+    conn.commit()
+    conn.close()
+
+    page = client.get("/keys", cookies=cookies)
+    assert page.status_code == 200
+    assert "cs_lega…" in page.text
+    assert "cs_legacy-secret" not in page.text
+    assert "hash-only; create a replacement to view/copy" in page.text
+    legacy_auth = client.get("/api/v1/whoami",
+                             headers=_hdr("cs_legacy-secret"))
+    assert legacy_auth.status_code == 200
 
 
 def test_version_endpoint_is_public(server):

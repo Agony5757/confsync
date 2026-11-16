@@ -1,7 +1,8 @@
 """SQLite data layer: accounts, identities, sessions, API keys, documents.
 
-Secrets at rest: only sha256 hashes of session tokens and API keys are stored;
-document contents are AES-256-GCM ciphertexts (see crypto.py).
+Secrets at rest: session tokens and API-key lookups use sha256 hashes; API keys
+are also AES-256-GCM encrypted so their owner can reveal them later. Document
+contents are AES-256-GCM ciphertexts (see crypto.py).
 
 Identity model: a single ``accounts`` table owns everything a user has
 (documents, keys, sessions) under one ``uid`` + ``username`` with any number
@@ -16,6 +17,8 @@ import json
 import os
 import sqlite3
 import time
+
+from confsync_server import crypto
 
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS accounts (
@@ -46,14 +49,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at REAL    NOT NULL
 );
 CREATE TABLE IF NOT EXISTS api_keys (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id      INTEGER NOT NULL REFERENCES accounts(uid),
-    name         TEXT    NOT NULL DEFAULT '',
-    key_hash     TEXT    NOT NULL UNIQUE,
-    prefix       TEXT    NOT NULL,
-    created_at   REAL    NOT NULL,
-    last_used_at REAL,
-    revoked      INTEGER NOT NULL DEFAULT 0
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL REFERENCES accounts(uid),
+    name           TEXT    NOT NULL DEFAULT '',
+    key_hash       TEXT    NOT NULL UNIQUE,
+    prefix         TEXT    NOT NULL,
+    key_ciphertext BLOB,
+    created_at     REAL    NOT NULL,
+    last_used_at   REAL,
+    revoked        INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS documents (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,14 +111,15 @@ CREATE TABLE sessions (
 )""",
     "api_keys": """\
 CREATE TABLE api_keys (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id      INTEGER NOT NULL REFERENCES accounts(uid),
-    name         TEXT    NOT NULL DEFAULT '',
-    key_hash     TEXT    NOT NULL UNIQUE,
-    prefix       TEXT    NOT NULL,
-    created_at   REAL    NOT NULL,
-    last_used_at REAL,
-    revoked      INTEGER NOT NULL DEFAULT 0
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL REFERENCES accounts(uid),
+    name           TEXT    NOT NULL DEFAULT '',
+    key_hash       TEXT    NOT NULL UNIQUE,
+    prefix         TEXT    NOT NULL,
+    key_ciphertext BLOB,
+    created_at     REAL    NOT NULL,
+    last_used_at   REAL,
+    revoked        INTEGER NOT NULL DEFAULT 0
 )""",
     "documents": """\
 CREATE TABLE documents (
@@ -167,15 +172,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
                     (u["id"], str(u["gitea_id"]), u["login"], u["created_at"]),
                 )
         # Child tables still carry FOREIGN KEY clauses pointing at ``users``;
-        # rebuild them against accounts (identical columns) before dropping it.
+        # rebuild them against accounts, preserving existing columns, before
+        # dropping the old table.
         for name, ddl in _CHILD_DDL.items():
             conn.execute(f"ALTER TABLE {name} RENAME TO {name}_old")
             conn.execute(ddl)
-            conn.execute(f"INSERT INTO {name} SELECT * FROM {name}_old")
+            columns = ", ".join(r["name"] for r in conn.execute(
+                f"PRAGMA table_info({name}_old)"))
+            conn.execute(
+                f"INSERT INTO {name} ({columns}) SELECT {columns} FROM {name}_old"
+            )
             conn.execute(f"DROP TABLE {name}_old")
         conn.execute("DROP TABLE users")
         conn.commit()
         conn.execute("PRAGMA foreign_keys=ON")
+    api_key_cols = {r["name"] for r in conn.execute("PRAGMA table_info(api_keys)")}
+    if "key_ciphertext" not in api_key_cols:
+        conn.execute("ALTER TABLE api_keys ADD COLUMN key_ciphertext BLOB")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_identities_provider_uid"
         " ON identities (provider, provider_uid)"
@@ -403,11 +416,15 @@ def delete_session(conn: sqlite3.Connection, token: str) -> None:
 # ── API keys ──────────────────────────────────────────────────────
 
 def create_api_key(conn: sqlite3.Connection, user_id: int, name: str,
-                   plaintext_key: str) -> None:
+                   plaintext_key: str, *, master_key: bytes) -> None:
+    key_hash = hash_token(plaintext_key)
+    ciphertext = crypto.encrypt(
+        master_key, plaintext_key.encode(), crypto.api_key_aad(user_id, key_hash)
+    )
     conn.execute(
-        "INSERT INTO api_keys (user_id, name, key_hash, prefix, created_at)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (user_id, name, hash_token(plaintext_key), plaintext_key[:8], time.time()),
+        "INSERT INTO api_keys (user_id, name, key_hash, prefix, key_ciphertext, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, name, key_hash, plaintext_key[:8], ciphertext, time.time()),
     )
     conn.commit()
 
@@ -426,10 +443,18 @@ def get_user_by_api_key(conn: sqlite3.Connection, plaintext_key: str) -> sqlite3
 
 def list_api_keys(conn: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
     return conn.execute(
-        "SELECT id, name, prefix, created_at, last_used_at, revoked FROM api_keys"
+        "SELECT id, user_id, name, key_hash, prefix, key_ciphertext,"
+        " created_at, last_used_at, revoked FROM api_keys"
         " WHERE user_id = ? ORDER BY id",
         (user_id,),
     ).fetchall()
+
+
+def decrypt_api_key(row: sqlite3.Row, master_key: bytes) -> str | None:
+    if row["key_ciphertext"] is None:
+        return None
+    aad = crypto.api_key_aad(row["user_id"], row["key_hash"])
+    return crypto.decrypt(master_key, row["key_ciphertext"], aad).decode()
 
 
 def revoke_api_key(conn: sqlite3.Connection, user_id: int, key_id: int) -> bool:

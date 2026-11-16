@@ -1,7 +1,13 @@
-"""API/auth data-layer tests: key hashing, sessions, allowlist bootstrap."""
+"""API/auth data-layer tests: key storage, sessions, OAuth helpers."""
+import asyncio
 import time
 
+import httpx
+import pytest
+
 from confsync_server import auth, db
+
+MASTER_KEY = b"k" * 32
 
 
 def _conn(tmp_path):
@@ -39,7 +45,7 @@ def test_api_key_lifecycle(tmp_path):
     key = auth.generate_api_key()
     assert key.startswith("cs_") and len(key) == 51
 
-    db.create_api_key(conn, account["uid"], "laptop", key)
+    db.create_api_key(conn, account["uid"], "laptop", key, master_key=MASTER_KEY)
     found = db.get_user_by_api_key(conn, key)
     assert found["username"] == "alice"
 
@@ -53,14 +59,17 @@ def test_api_key_lifecycle(tmp_path):
     conn.close()
 
 
-def test_api_key_only_hash_stored(tmp_path):
+def test_api_key_stores_hash_and_ciphertext_not_plaintext(tmp_path):
     conn = _conn(tmp_path)
     account = _make_account(conn)
     key = auth.generate_api_key()
-    db.create_api_key(conn, account["uid"], "laptop", key)
+    db.create_api_key(conn, account["uid"], "laptop", key, master_key=MASTER_KEY)
     row = conn.execute("SELECT * FROM api_keys").fetchone()
     assert key not in row["key_hash"]
+    assert key.encode() not in row["key_ciphertext"]
     assert row["prefix"] == key[:8]
+    listed = db.list_api_keys(conn, account["uid"])[0]
+    assert db.decrypt_api_key(listed, MASTER_KEY) == key
     conn.close()
 
 
@@ -76,3 +85,34 @@ def test_session_expiry(tmp_path):
     conn.commit()
     assert db.get_session_user(conn, token) is None
     conn.close()
+
+
+def _mock_http(monkeypatch, handler):
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+
+
+def test_github_network_error_is_normalized(monkeypatch):
+    def handler(request):
+        raise httpx.ConnectError("connection failed", request=request)
+
+    _mock_http(monkeypatch, handler)
+    with pytest.raises(ValueError, match="GitHub user fetch failed"):
+        asyncio.run(auth.fetch_github_user("oauth-token"))
+
+
+def test_github_unexpected_email_response_is_normalized(monkeypatch):
+    def handler(request):
+        if request.url == auth.GITHUB_USER_URL:
+            return httpx.Response(200, json={
+                "id": 1001, "login": "alice", "email": None,
+            })
+        assert request.url == auth.GITHUB_EMAILS_URL
+        return httpx.Response(200, json={"message": "unexpected"})
+
+    _mock_http(monkeypatch, handler)
+    with pytest.raises(ValueError, match="GitHub email fetch"):
+        asyncio.run(auth.fetch_github_user("oauth-token"))

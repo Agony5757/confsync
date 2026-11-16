@@ -57,6 +57,11 @@ def document_aad(user_id: int, app: str, name: str) -> bytes:
     return f"{user_id}/{app}/{name}".encode()
 
 
+def api_key_aad(user_id: int, key_hash: str) -> bytes:
+    """AAD binding an encrypted API key to its owner and lookup hash."""
+    return f"api-key/{user_id}/{key_hash}".encode()
+
+
 def encrypt(key: bytes, plaintext: bytes, aad: bytes) -> bytes:
     nonce = secrets.token_bytes(_NONCE_LEN)
     ct = AESGCM(key).encrypt(nonce, plaintext, aad)

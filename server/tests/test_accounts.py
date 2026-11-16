@@ -1,11 +1,12 @@
 """Account model: uid/username/email bindings, identity linking, isolation,
 migration from the pre-0.3 users table."""
 import sqlite3
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from starlette.testclient import TestClient
 
-from confsync_server import db
+from confsync_server import auth, db
 from confsync_server.app import create_app
 from confsync_server.config import ServerSettings
 
@@ -130,6 +131,48 @@ VALUES (1, 'app', 'doc', X'00', 1, 100);
     conn.close()
 
 
+def test_migration_adds_retrievable_api_key_storage(tmp_path):
+    path = str(tmp_path / "0.3.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""\
+CREATE TABLE accounts (
+    uid INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    email_binding_list TEXT NOT NULL DEFAULT '[]',
+    name TEXT NOT NULL DEFAULT '',
+    avatar_url TEXT NOT NULL DEFAULT '',
+    is_admin INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+CREATE TABLE api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES accounts(uid),
+    name TEXT NOT NULL DEFAULT '',
+    key_hash TEXT NOT NULL UNIQUE,
+    prefix TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    last_used_at REAL,
+    revoked INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO accounts (username, created_at) VALUES ('alice', 100);
+INSERT INTO api_keys (user_id, name, key_hash, prefix, created_at)
+VALUES (1, 'legacy', 'old-hash', 'cs_lega', 100);
+""")
+    conn.close()
+
+    conn = db.connect(path)
+    legacy = db.list_api_keys(conn, 1)[0]
+    assert legacy["key_ciphertext"] is None
+    assert db.decrypt_api_key(legacy, b"k" * 32) is None
+
+    key = "cs_new-retrievable-key"
+    db.create_api_key(conn, 1, "new", key, master_key=b"k" * 32)
+    created = db.list_api_keys(conn, 1)[1]
+    assert db.decrypt_api_key(created, b"k" * 32) == key
+    assert db.get_user_by_api_key(conn, key)["username"] == "alice"
+    conn.close()
+
+
 # ── app-level: login → account resolution & isolation ────────────
 
 @pytest.fixture()
@@ -196,6 +239,65 @@ def test_resolver_identity_wins_over_email(app_server):
     conn.close()
 
 
+def test_existing_identity_backfills_email_binding(app_server):
+    from confsync_server.app import _resolve_account
+
+    conn = db.connect(app_server.app.state.settings.db_path)
+    account = db.create_account(conn, "Agony5757")
+    db.link_identity(conn, account["uid"], "github", GH["id"], GH["login"])
+
+    resolved = _resolve_account(conn, "github", {**GH, "email": "Agony@Example.com"})
+
+    assert resolved["uid"] == account["uid"]
+    assert db.get_account_by_email(conn, "agony@example.com")["uid"] == account["uid"]
+    conn.close()
+
+
+def test_github_oauth_callback_logs_in_and_binds_email(app_server, monkeypatch):
+    async def fake_exchange(client_id, client_secret, code, redirect_uri):
+        assert client_id == "gh-id"
+        assert redirect_uri == "http://testserver/auth/github/callback"
+        return "oauth-token"
+
+    async def fake_fetch(token):
+        assert token == "oauth-token"
+        return {**GH, "email": "agony@example.com"}
+
+    monkeypatch.setattr(auth, "exchange_code", fake_exchange)
+    monkeypatch.setattr(auth, "fetch_github_user", fake_fetch)
+    login = app_server.get("/auth/github/login", follow_redirects=False)
+    state = parse_qs(urlparse(login.headers["location"]).query)["state"][0]
+
+    resp = app_server.get(f"/auth/github/callback?code=c&state={state}")
+
+    assert resp.status_code == 200
+    assert "Agony5757" in resp.text
+    conn = db.connect(app_server.app.state.settings.db_path)
+    account = db.get_account_by_username(conn, "Agony5757")
+    assert db.get_account_by_email(conn, "agony@example.com")["uid"] == account["uid"]
+    assert db.get_identity(conn, "github", GH["id"])["uid"] == account["uid"]
+    conn.close()
+
+
+def test_github_oauth_upstream_failure_shows_error_page(app_server, monkeypatch):
+    async def fake_exchange(client_id, client_secret, code, redirect_uri):
+        return "oauth-token"
+
+    async def fake_fetch(token):
+        raise ValueError("GitHub user fetch failed: connection failed")
+
+    monkeypatch.setattr(auth, "exchange_code", fake_exchange)
+    monkeypatch.setattr(auth, "fetch_github_user", fake_fetch)
+    login = app_server.get("/auth/github/login", follow_redirects=False)
+    state = parse_qs(urlparse(login.headers["location"]).query)["state"][0]
+
+    resp = app_server.get(f"/auth/github/callback?code=c&state={state}")
+
+    assert resp.status_code == 200
+    assert "GitHub user fetch failed: connection failed" in resp.text
+    assert "Internal Server Error" not in resp.text
+
+
 def test_accounts_see_different_documents(tmp_path):
     settings = ServerSettings(home=str(tmp_path), external_url="http://testserver",
                               github_client_id="gh-id")
@@ -207,7 +309,8 @@ def test_accounts_see_different_documents(tmp_path):
             db.allow_login(conn, username)
             account = db.create_account(conn, username)
             key = "cs_" + username
-            db.create_api_key(conn, account["uid"], "t", key)
+            db.create_api_key(conn, account["uid"], "t", key,
+                              master_key=app.state.master_key)
             keys[username] = key
         conn.close()
 

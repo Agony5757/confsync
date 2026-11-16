@@ -38,7 +38,8 @@ button, .btn { padding: .3rem .8rem; border: 1px solid #ccc; border-radius: 6px;
 button.primary { background: #1f883d; color: #fff; border-color: #1f883d; }
 button.danger { color: #cf222e; }
 code.key { background: #fff8c5; padding: .4rem .6rem; border-radius: 6px;
-           display: inline-block; margin: .5rem 0; }
+           display: inline-block; margin: .5rem .5rem .5rem 0; overflow-wrap: anywhere;
+           user-select: all; }
 .flash { background: #dafbe1; border: 1px solid #1f883d; padding: .5rem .8rem;
          border-radius: 6px; margin-bottom: 1rem; }
 .error { background: #ffebe9; border: 1px solid #cf222e; padding: .5rem .8rem;
@@ -86,6 +87,37 @@ def _page(title: str, body: str, user=None, flash: str = "", error: str = "") ->
 {nav}
 {flash_html}{error_html}
 {body}
+<script>
+document.querySelectorAll("[data-copy-target]").forEach((button) => {{
+  button.addEventListener("click", async () => {{
+    const element = document.getElementById(button.dataset.copyTarget);
+    try {{
+      if (navigator.clipboard && window.isSecureContext) {{
+        await navigator.clipboard.writeText(element.textContent);
+      }} else {{
+        const input = document.createElement("textarea");
+        input.value = element.textContent;
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        input.select();
+        const copied = document.execCommand("copy");
+        input.remove();
+        if (!copied) throw new Error("copy failed");
+      }}
+      button.textContent = "Copied";
+    }} catch {{
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      button.textContent = "Press Ctrl+C";
+    }}
+    setTimeout(() => {{ button.textContent = "Copy"; }}, 1500);
+  }});
+}});
+</script>
 </body></html>"""
     return Response(page, media_type="text/html")
 
@@ -278,6 +310,18 @@ def _check_oauth_state(request: Request) -> str | None:
     return None
 
 
+def _bind_profile_email(conn, uid: int, email: str) -> None:
+    email = email.strip().lower()
+    if not email or db.get_account_by_email(conn, email) is not None:
+        return
+    try:
+        db.bind_email(conn, uid, email)
+    except ValueError:
+        # Provider profiles are external input; an invalid or concurrently
+        # claimed email must not prevent an already verified identity login.
+        pass
+
+
 def _resolve_account(conn, provider: str, profile: dict):
     """Map a provider profile (OAuth login or verified token) to an account:
     an existing identity row → its account; else a matching bound email →
@@ -289,6 +333,7 @@ def _resolve_account(conn, provider: str, profile: dict):
         db.touch_identity(conn, identity["id"], profile["login"], profile.get("email", ""))
         db.update_account_profile(conn, identity["uid"], profile["name"],
                                   profile["avatar_url"])
+        _bind_profile_email(conn, identity["uid"], profile.get("email", ""))
         return db.get_account_by_uid(conn, identity["uid"])
     email = profile.get("email") or ""
     if email:
@@ -311,11 +356,13 @@ def _resolve_account(conn, provider: str, profile: dict):
                              profile["login"], email)
             db.update_account_profile(conn, account["uid"], profile["name"],
                                       profile["avatar_url"])
+            _bind_profile_email(conn, account["uid"], email)
             return db.get_account_by_uid(conn, account["uid"])
     account = db.create_account(conn, profile["login"], name=profile["name"],
                                 avatar_url=profile["avatar_url"])
     db.link_identity(conn, account["uid"], provider, profile["id"],
                      profile["login"], email)
+    _bind_profile_email(conn, account["uid"], email)
     return account
 
 
@@ -554,6 +601,17 @@ async def web_keys(request: Request) -> Response:
         conn.close()
     rows = ""
     for k in keys:
+        plaintext = db.decrypt_api_key(k, _master_key(request))
+        if plaintext is None:
+            key_html = (
+                f"<code>{_e(k['prefix'])}…</code> "
+                "<span class='muted'>hash-only; create a replacement to view/copy</span>"
+            )
+        else:
+            key_html = (
+                f"<code class='key' id='api-key-{k['id']}'>{_e(plaintext)}</code>"
+                f"<button type='button' data-copy-target='api-key-{k['id']}'>Copy</button>"
+            )
         if k["revoked"]:
             action = ""
             status = "revoked"
@@ -564,15 +622,16 @@ async def web_keys(request: Request) -> Response:
             )
             status = ""
         rows += (
-            f"<tr><td>{_e(k['name'])}</td><td><code>{_e(k['prefix'])}…</code></td>"
+            f"<tr><td>{_e(k['name'])}</td><td>{key_html}</td>"
             f"<td>{_fmt_ts(k['created_at'])}</td><td>{_fmt_ts(k['last_used_at'])}</td>"
             f"<td>{status}</td><td>{action}</td></tr>"
         )
-    table = ("<table><tr><th>Name</th><th>Prefix</th><th>Created</th><th>Last used</th>"
+    table = ("<table><tr><th>Name</th><th>API key</th><th>Created</th><th>Last used</th>"
              f"<th></th><th></th></tr>{rows}</table>" if rows
              else "<p class='muted'>No API keys yet.</p>")
     body = f"""
     <h1>API Keys</h1>
+    <p class="muted">You can view and copy your keys whenever you are logged in.</p>
     {table}
     <h2>Create key</h2>
     <form method="post" action="/keys/create">
@@ -592,13 +651,15 @@ async def web_key_create(request: Request) -> Response:
     plaintext = auth.generate_api_key()
     conn = _open_db(request)
     try:
-        db.create_api_key(conn, user["uid"], name, plaintext)
+        db.create_api_key(conn, user["uid"], name, plaintext,
+                          master_key=_master_key(request))
     finally:
         conn.close()
     body = f"""
     <h1>API key created</h1>
-    <p>Copy it now — it will <b>not</b> be shown again:</p>
-    <code class="key">{_e(plaintext)}</code>
+    <p>You can view and copy it anytime from API Keys while logged in.</p>
+    <code class="key" id="new-api-key">{_e(plaintext)}</code>
+    <button type="button" data-copy-target="new-api-key">Copy</button>
     <p>Use it with: <code>confsync login --server {_e(_settings(request).external_url)}</code></p>
     <p><a class="btn" href="/keys">Back to keys</a></p>
     """

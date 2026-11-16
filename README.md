@@ -44,8 +44,10 @@ Upgrading an existing deployment? See [MIGRATION.md](MIGRATION.md).
   same username is adopted, else a new account is created — gated by an
   allowlist of usernames (the first user to log in becomes admin). Documents,
   API keys and sessions belong to the account, so accounts only ever see
-  their own documents. API keys (`cs_…`) for CLI/library access — only
-  sha256 is stored, the plaintext is shown once at creation. Admins manage
+  their own documents. API keys (`cs_…`) for CLI/library access use a sha256
+  lookup hash plus AES-256-GCM ciphertext, so logged-in owners can view and
+  copy them under `/keys`. Legacy hash-only keys remain valid but cannot be
+  revealed; create a replacement to see its full value. Admins manage
   accounts, email bindings and the allowlist under `/admin`.
 - **History**: every push archives the previous version (last 20 kept), with
   view/rollback in the Web UI.

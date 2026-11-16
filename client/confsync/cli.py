@@ -27,8 +27,8 @@ $CONFSYNC_CREDENTIALS. Re-login anytime; logout = delete the file.
 
 Two kinds of credentials are accepted:
 
-  1. API key (cs_...)   Create one in the web UI under /keys. Shown once;
-                        only its hash is stored server-side.
+  1. API key (cs_...)   Create one in the web UI under /keys. Logged-in
+                        owners can view and copy it there anytime.
   2. Gitea access token If the server has Gitea configured, paste a token
                         from Gitea (Settings -> Applications -> Access
                         Tokens, scope read:user is enough). The server
