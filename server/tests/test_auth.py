@@ -104,6 +104,17 @@ def test_github_network_error_is_normalized(monkeypatch):
         asyncio.run(auth.fetch_github_user("oauth-token"))
 
 
+def test_github_token_error_includes_provider_code(monkeypatch):
+    def handler(request):
+        return httpx.Response(200, json={
+            "error": "bad_verification_code", "error_description": "",
+        })
+
+    _mock_http(monkeypatch, handler)
+    with pytest.raises(ValueError, match="bad_verification_code"):
+        asyncio.run(auth.exchange_code("cid", "secret", "code", "https://cb"))
+
+
 def test_github_unexpected_email_response_is_normalized(monkeypatch):
     def handler(request):
         if request.url == auth.GITHUB_USER_URL:

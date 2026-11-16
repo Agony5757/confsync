@@ -281,7 +281,7 @@ async def github_login(request: Request) -> Response:
     if not s.github_client_id:
         return _page("Error", "", error="GitHub OAuth is not configured.")
     state = auth.generate_oauth_state()
-    request.app.state.oauth_states.add(state)
+    request.app.state.oauth_states[state] = None
     url = auth.build_authorize_url(
         s.github_client_id, f"{s.external_url}/auth/github/callback", state
     )
@@ -293,21 +293,23 @@ async def gitea_login(request: Request) -> Response:
     if not s.gitea_configured:
         return _page("Error", "", error="Gitea OAuth is not configured.")
     state = auth.generate_oauth_state()
-    request.app.state.oauth_states.add(state)
+    verifier = auth.generate_pkce_verifier()
+    request.app.state.oauth_states[state] = verifier
     url = auth.build_gitea_authorize_url(
-        s.gitea_url, s.gitea_client_id, f"{s.external_url}/auth/gitea/callback", state
+        s.gitea_url, s.gitea_client_id, f"{s.external_url}/auth/gitea/callback",
+        state, auth.pkce_challenge(verifier),
     )
     return RedirectResponse(url)
 
 
-def _check_oauth_state(request: Request) -> str | None:
-    """Returns an error message when the OAuth state is missing/unknown."""
+def _pop_oauth_state(request: Request) -> tuple[str, str | None]:
+    """Returns (PKCE verifier for this state, error message). The verifier is
+    '' for providers that do not use PKCE."""
     state = request.query_params.get("state", "")
     states = request.app.state.oauth_states
     if not state or state not in states:
-        return "Invalid OAuth state; try logging in again."
-    states.discard(state)
-    return None
+        return "", "Invalid OAuth state; try logging in again."
+    return states.pop(state) or "", None
 
 
 def _bind_profile_email(conn, uid: int, email: str) -> None:
@@ -392,8 +394,11 @@ def _login_profile(request: Request, provider: str, profile: dict) -> Response:
 
 async def github_callback(request: Request) -> Response:
     s = _settings(request)
-    if (err := _check_oauth_state(request)) is not None:
+    _, err = _pop_oauth_state(request)
+    if err is not None:
         return _page("Error", "", error=err)
+    if provider_error := request.query_params.get("error_description") or request.query_params.get("error"):
+        return _page("Error", "", error=f"GitHub login failed: {provider_error}")
     code = request.query_params.get("code", "")
     if not code:
         return _page("Error", "", error="Missing OAuth code from GitHub.")
@@ -412,8 +417,11 @@ async def github_callback(request: Request) -> Response:
 
 async def gitea_callback(request: Request) -> Response:
     s = _settings(request)
-    if (err := _check_oauth_state(request)) is not None:
+    verifier, err = _pop_oauth_state(request)
+    if err is not None:
         return _page("Error", "", error=err)
+    if provider_error := request.query_params.get("error_description") or request.query_params.get("error"):
+        return _page("Error", "", error=f"Gitea login failed: {provider_error}")
     code = request.query_params.get("code", "")
     if not code:
         return _page("Error", "", error="Missing OAuth code from Gitea.")
@@ -421,7 +429,7 @@ async def gitea_callback(request: Request) -> Response:
     try:
         token = await auth.exchange_gitea_code(
             s.gitea_url, s.gitea_client_id, s.gitea_client_secret, code,
-            f"{s.external_url}/auth/gitea/callback",
+            f"{s.external_url}/auth/gitea/callback", verifier,
         )
         profile = await auth.fetch_gitea_user(s.gitea_url, token)
     except ValueError as exc:
@@ -1038,6 +1046,6 @@ def create_app(settings: ServerSettings | None = None) -> Starlette:
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.settings = settings
     app.state.master_key = master_key
-    app.state.oauth_states = set()
+    app.state.oauth_states = {}
     app.state.gitea_token_cache = {}
     return app

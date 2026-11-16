@@ -1,6 +1,8 @@
 """GitHub/Gitea OAuth flows and token/API-key generation helpers."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import secrets
 import string
 from urllib.parse import urlencode
@@ -74,7 +76,9 @@ async def exchange_code(client_id: str, client_secret: str, code: str,
     data = _json_object(resp, "GitHub")
     token = data.get("access_token")
     if resp.status_code != 200 or not token:
-        raise ValueError(f"GitHub token exchange failed: {data.get('error_description') or data}")
+        detail = (data.get("error_description") or data.get("error")
+                  or f"HTTP {resp.status_code}")
+        raise ValueError(f"GitHub token exchange failed: {detail}")
     return token
 
 
@@ -124,32 +128,48 @@ async def fetch_github_user(access_token: str) -> dict:
     }
 
 
+def generate_pkce_verifier() -> str:
+    return secrets.token_urlsafe(48)
+
+
+def pkce_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
 def build_gitea_authorize_url(gitea_url: str, client_id: str, redirect_uri: str,
-                              state: str) -> str:
-    query = urlencode({
+                              state: str, code_challenge: str = "") -> str:
+    params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
         "state": state,
         "scope": GITEA_SCOPE,
-    })
-    return f"{gitea_url}{GITEA_AUTHORIZE_PATH}?{query}"
+    }
+    if code_challenge:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = "S256"
+    return f"{gitea_url}{GITEA_AUTHORIZE_PATH}?{urlencode(params)}"
 
 
 async def exchange_gitea_code(gitea_url: str, client_id: str, client_secret: str,
-                              code: str, redirect_uri: str) -> str:
+                              code: str, redirect_uri: str,
+                              code_verifier: str = "") -> str:
     """Exchange an OAuth code for a Gitea access token."""
+    form = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": redirect_uri,
+    }
+    if code_verifier:
+        form["code_verifier"] = code_verifier
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
                 f"{gitea_url}{GITEA_TOKEN_PATH}",
-                data={
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "code": code,
-                    "grant_type": "authorization_code",
-                    "redirect_uri": redirect_uri,
-                },
+                data=form,
                 headers={"Accept": "application/json"},
             )
     except httpx.HTTPError as exc:
@@ -157,9 +177,9 @@ async def exchange_gitea_code(gitea_url: str, client_id: str, client_secret: str
     data = _json_object(resp, "Gitea")
     token = data.get("access_token")
     if resp.status_code != 200 or not token:
-        raise ValueError(
-            f"Gitea token exchange failed: {data.get('error_description') or data.get('error') or data}"
-        )
+        detail = (data.get("error_description") or data.get("error")
+                  or f"HTTP {resp.status_code}")
+        raise ValueError(f"Gitea token exchange failed: {detail}")
     return token
 
 

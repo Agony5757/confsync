@@ -45,7 +45,12 @@ def _oauth_state(client) -> str:
     assert resp.status_code == 307
     loc = resp.headers["location"]
     assert loc.startswith(f"{GITEA_URL}/login/oauth/authorize")
-    return parse_qs(urlparse(loc).query)["state"][0]
+    q = parse_qs(urlparse(loc).query)
+    state = q["state"][0]
+    verifier = client.app.state.oauth_states[state]
+    assert q["code_challenge"] == [auth.pkce_challenge(verifier)]
+    assert q["code_challenge_method"] == ["S256"]
+    return state
 
 
 # ── settings ──────────────────────────────────────────────────────
@@ -74,8 +79,10 @@ def test_settings_gitea_yaml_and_env(tmp_path, monkeypatch):
 
 
 def test_build_gitea_authorize_url():
+    verifier = "pkce verifier"
+    challenge = auth.pkce_challenge(verifier)
     url = auth.build_gitea_authorize_url(
-        GITEA_URL, "cid", "https://cb.example.com/cb", "st ate"
+        GITEA_URL, "cid", "https://cb.example.com/cb", "st ate", challenge
     )
     parts = urlparse(url)
     assert f"{parts.scheme}://{parts.netloc}{parts.path}" == f"{GITEA_URL}/login/oauth/authorize"
@@ -85,7 +92,16 @@ def test_build_gitea_authorize_url():
         "response_type": ["code"],
         "state": ["st ate"],
         "scope": ["read:user"],
+        "code_challenge": [challenge],
+        "code_challenge_method": ["S256"],
     }
+
+
+def test_pkce_challenge_is_s256_base64url():
+    challenge = auth.pkce_challenge("test-verifier")
+    assert challenge == "JBbiqONGWPaAmwXk_8bT6UnlPfrn65D32eZlJS-zGG0"
+    assert "=" not in challenge
+    assert auth.pkce_challenge(auth.generate_pkce_verifier()) != challenge
 
 
 def test_gitea_token_exchange_uses_form_encoding(monkeypatch):
@@ -98,6 +114,7 @@ def test_gitea_token_exchange_uses_form_encoding(monkeypatch):
             "code": ["oauth code"],
             "grant_type": ["authorization_code"],
             "redirect_uri": ["https://cb.example.com/cb"],
+            "code_verifier": ["pkce-verifier"],
         }
         return httpx.Response(200, json={"access_token": "oauth-token"})
 
@@ -107,7 +124,8 @@ def test_gitea_token_exchange_uses_form_encoding(monkeypatch):
         lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
     )
     token = asyncio.run(auth.exchange_gitea_code(
-        GITEA_URL, "cid", "secret", "oauth code", "https://cb.example.com/cb"
+        GITEA_URL, "cid", "secret", "oauth code", "https://cb.example.com/cb",
+        "pkce-verifier",
     ))
     assert token == "oauth-token"
 
@@ -176,15 +194,18 @@ def test_gitea_login_redirects_with_state(gitea_server):
 
 
 def test_gitea_oauth_callback_logs_in(gitea_server, monkeypatch):
-    async def fake_exchange(gitea_url, client_id, client_secret, code, redirect_uri):
+    async def fake_exchange(gitea_url, client_id, client_secret, code, redirect_uri,
+                            code_verifier):
         assert (client_id, client_secret) == ("gt-id", "gt-secret")
         assert redirect_uri == "http://testserver/auth/gitea/callback"
+        assert code_verifier == expected_verifier
         return "oauth-token"
 
     _patch_fetch(monkeypatch, token="oauth-token")
     monkeypatch.setattr(auth, "exchange_gitea_code", fake_exchange)
 
     state = _oauth_state(gitea_server)
+    expected_verifier = gitea_server.app.state.oauth_states[state]
     resp = gitea_server.get(f"/auth/gitea/callback?code=c&state={state}")
     assert resp.status_code == 200  # followed the redirect to /
     assert "gitea-user" in resp.text  # nav shows the logged-in account
@@ -203,12 +224,25 @@ def test_gitea_oauth_callback_rejects_bad_state(gitea_server):
     assert "Invalid OAuth state" in resp.text
 
 
+def test_gitea_oauth_provider_error_is_shown(gitea_server):
+    state = _oauth_state(gitea_server)
+    resp = gitea_server.get(
+        "/auth/gitea/callback",
+        params={"error": "invalid_request",
+                "error_description": "PKCE is required for public clients",
+                "state": state},
+    )
+    assert "Gitea login failed: PKCE is required for public clients" in resp.text
+
+
 def test_gitea_oauth_denied_when_not_allowlisted(gitea_server, monkeypatch):
     conn = db.connect(gitea_server.app.state.settings.db_path)
     db.create_account(conn, "admin")  # accounts exist → allowlist applies
     conn.close()
 
-    async def fake_exchange(gitea_url, client_id, client_secret, code, redirect_uri):
+    async def fake_exchange(gitea_url, client_id, client_secret, code, redirect_uri,
+                            code_verifier):
+        assert code_verifier
         return "oauth-token"
 
     _patch_fetch(monkeypatch, token="oauth-token")
