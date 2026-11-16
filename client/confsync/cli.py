@@ -6,6 +6,7 @@ import getpass
 import sys
 
 from confsync import __version__
+from confsync.auth import browser_login
 from confsync.core import ConfsyncError
 from confsync.credentials import get_credentials_path, load_client, login
 
@@ -19,13 +20,18 @@ HELP_TOPICS = {
     "auth": """\
 confsync help: auth — logging in
 
+  confsync auth login --server https://confsync.example.com
+
+The recommended flow opens your browser. Sign in with GitHub/Gitea, click
+Allow/Authorize, and the CLI saves an API key to ~/.confsync/credentials.json
+(mode 0600). Credentials are shared by every tool that imports confsync.
+Override the path with $CONFSYNC_CREDENTIALS. Re-login anytime; logout =
+delete the file.
+
+  confsync auth login --server https://confsync.example.com --no-browser
   confsync login --server https://confsync.example.com [--api-key KEY]
 
-Credentials are saved to ~/.confsync/credentials.json (mode 0600) and shared
-by every tool that imports confsync. Override the path with
-$CONFSYNC_CREDENTIALS. Re-login anytime; logout = delete the file.
-
-Two kinds of credentials are accepted:
+Manual credentials are also accepted:
 
   1. API key (cs_...)   Create one in the web UI under /keys. Logged-in
                         owners can view and copy it there anytime.
@@ -35,7 +41,8 @@ Two kinds of credentials are accepted:
                         verifies it against your Gitea (cached ~5 min) and
                         maps it to your confsync account (identity or email).
 
-Requires client >= 0.2.0 for Gitea tokens (older clients insist on cs_ keys).\
+Browser login needs client >= 0.5.0 and server >= 0.5.0. Gitea-token login
+needs client >= 0.2.0 and server >= 0.2.0.\
 """,
 
     "upgrade": """\
@@ -129,15 +136,15 @@ HELP_OVERVIEW = f"""\
 confsync {__version__} — sync config documents with a confsync server
 
 Quick start:
-  confsync login --server https://confsync.example.com   # cs_ key or Gitea token
+  confsync auth login --server https://confsync.example.com  # browser + Allow
   confsync push --app myapp --name config.yaml --file path/to/file
   confsync pull --app myapp --name config.yaml            # to stdout
   confsync list
 
-Commands: login, push, pull, list, history, delete, help
+Commands: auth, login, push, pull, list, history, delete, help
 
 Topics (confsync help <topic>):
-  auth            logging in: API keys and Gitea access tokens
+  auth            logging in: browser authorization, API keys, Gitea tokens
   upgrade         upgrading client/server and compatibility notes
   api             REST API reference
   server          server deployment pointers (Docker, env, data)
@@ -168,7 +175,9 @@ def cmd_login(args: argparse.Namespace) -> None:
     api_key = args.api_key
     if not api_key:
         print(f"Create an API key in the web UI ({args.server}/keys), or use a "
-              "Gitea access token if the server has Gitea configured.")
+              "Gitea access token if the server has Gitea configured. "
+              "For browser login, run: confsync auth login --server "
+              f"{args.server}")
         api_key = getpass.getpass("API key / Gitea token: ").strip()
     try:
         with login(args.server, api_key) as client:
@@ -176,6 +185,16 @@ def cmd_login(args: argparse.Namespace) -> None:
     except ConfsyncError as exc:
         _fail(str(exc))
     print(f"Logged in as {who['login']} @ {args.server}")
+    print(f"Credentials saved to {get_credentials_path()}")
+
+
+def cmd_auth_login(args: argparse.Namespace) -> None:
+    try:
+        who = browser_login(args.server, open_browser=not args.no_browser,
+                            timeout=args.timeout, key_name=args.key_name)
+    except ConfsyncError as exc:
+        _fail(str(exc))
+    print(f"Logged in as {who.get('username') or who['login']} @ {args.server}")
     print(f"Credentials saved to {get_credentials_path()}")
 
 
@@ -250,6 +269,16 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="group")
 
+    auth_parser = sub.add_parser("auth", help="Log in by authorizing in a browser")
+    auth_sub = auth_parser.add_subparsers(dest="action", required=True)
+    p = auth_sub.add_parser("login", help="Open a browser, authorize, save an API key")
+    p.add_argument("--server", required=True, help="e.g. https://confsync.example.com")
+    p.add_argument("--no-browser", action="store_true",
+                   help="Print the authorization URL instead of opening a browser")
+    p.add_argument("--timeout", type=int, default=600,
+                   help="Seconds to wait for browser authorization (default: 600)")
+    p.add_argument("--key-name", help="API key name shown in the web UI")
+
     p = sub.add_parser("login", help="Save server URL + API key (shared credentials)")
     p.add_argument("--server", required=True, help="e.g. https://confsync.example.com")
     p.add_argument("--api-key", help="API key (cs_...); prompted if omitted")
@@ -281,9 +310,9 @@ def main() -> None:
 
     args = parser.parse_args()
     handlers = {
-        "login": cmd_login, "push": cmd_push, "pull": cmd_pull,
-        "list": cmd_list, "history": cmd_history, "delete": cmd_delete,
-        "help": cmd_help,
+        "auth": cmd_auth_login, "login": cmd_login, "push": cmd_push,
+        "pull": cmd_pull, "list": cmd_list, "history": cmd_history,
+        "delete": cmd_delete, "help": cmd_help,
     }
     handler = handlers.get(args.group or "")
     if handler is None:

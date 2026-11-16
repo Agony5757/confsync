@@ -9,9 +9,11 @@ Typical usage from another project (e.g. flexgate):
 """
 from __future__ import annotations
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
+from confsync.auth import browser_login
 from confsync.core import ConfsyncClient, ConfsyncError
 from confsync.credentials import load_client, login
 
-__all__ = ["ConfsyncClient", "ConfsyncError", "load_client", "login", "__version__"]
+__all__ = ["ConfsyncClient", "ConfsyncError", "browser_login",
+           "load_client", "login", "__version__"]

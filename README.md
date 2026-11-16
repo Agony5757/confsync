@@ -47,8 +47,10 @@ Upgrading an existing deployment? See [MIGRATION.md](MIGRATION.md).
   their own documents. API keys (`cs_…`) for CLI/library access use a sha256
   lookup hash plus AES-256-GCM ciphertext, so logged-in owners can view and
   copy them under `/keys`. Legacy hash-only keys remain valid but cannot be
-  revealed; create a replacement to see its full value. Admins manage
-  accounts, email bindings and the allowlist under `/admin`.
+  revealed; create a replacement to see its full value. The CLI can also
+  create its key through a browser OAuth flow with a loopback callback and a
+  one-time exchange code. Admins manage accounts, email bindings and the
+  allowlist under `/admin`.
 - **History**: every push archives the previous version (last 20 kept), with
   view/rollback in the Web UI.
 
@@ -117,7 +119,10 @@ every key overridable by env (`CONFSYNC_HOST`, `CONFSYNC_PORT`,
 ```bash
 pip install ./client          # or: uv tool install ./client
 
-confsync login --server https://confsync.tool.chenzhaoyun.com   # paste API key (or a Gitea access token)
+confsync auth login --server https://confsync.tool.chenzhaoyun.com
+# opens the browser → sign in with GitHub/Gitea → Allow → CLI saves an API key
+# add --no-browser on a headless/SSH machine and open the printed URL elsewhere
+confsync login --server https://confsync.tool.chenzhaoyun.com   # or paste API key / Gitea token
 confsync push --app flexgate --name config.yaml --file ~/.flexgate/config.yaml
 confsync pull --app flexgate --name config.yaml                 # to stdout
 confsync pull --app flexgate --name config.yaml --version 3     # history version
@@ -156,6 +161,7 @@ access token also works when the server has Gitea configured):
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/version` | public server version (no auth) |
+| POST | `/auth/exchange` | browser-login completion: one-time code → new API key |
 | GET | `/whoami` | verify the key |
 | GET | `/documents` | list documents |
 | GET/PUT/DELETE | `/documents/{app}/{name}` | pull / push (`{"content": "..."}`) / delete |

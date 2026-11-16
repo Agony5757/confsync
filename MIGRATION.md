@@ -4,6 +4,14 @@ Rollout guide for existing deployments. Example below upgrades **0.2.x →
 0.3.x** (the unified-account release), but the same steps apply to any
 version.
 
+What 0.5.0 changes:
+
+- **Browser-assisted CLI login**: `confsync auth login --server <url>` starts
+  a temporary receiver on `127.0.0.1`, opens `/auth/cli/login`, and after the
+  user authorizes GitHub/Gitea exchanges a one-time code at
+  `POST /api/v1/auth/exchange` for a normal retrievable API key. The callback
+  is restricted to loopback HTTP URLs.
+
 What 0.4.x changes on the server:
 
 - **OAuth reliability/account linking**: Gitea token exchange uses the standard

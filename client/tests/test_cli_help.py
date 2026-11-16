@@ -16,7 +16,7 @@ def test_help_overview(monkeypatch, capsys):
     _run(["help"], monkeypatch)
     out = capsys.readouterr().out
     assert "Quick start" in out
-    assert "confsync login" in out
+    assert "confsync auth login" in out
     for topic in HELP_TOPICS:
         assert topic in out
 
@@ -28,7 +28,8 @@ def test_help_every_topic(monkeypatch, capsys):
         assert text.splitlines()[0] in out
 
 
-def test_help_auth_mentions_both_credential_kinds():
+def test_help_auth_mentions_browser_login():
+    assert "confsync auth login" in HELP_TOPICS["auth"]
     assert "cs_" in HELP_TOPICS["auth"]
     assert "Gitea access token" in HELP_TOPICS["auth"]
 
@@ -48,5 +49,5 @@ def test_help_unknown_topic_fails_with_list(monkeypatch, capsys):
 
 
 def test_overview_lists_commands():
-    for cmd in ("login", "push", "pull", "list", "history", "delete"):
+    for cmd in ("auth", "login", "push", "pull", "list", "history", "delete"):
         assert cmd in HELP_OVERVIEW
